@@ -58,26 +58,20 @@ Measured on physical R36H (`192.168.1.19`) running `ultra_performance` (`NFSU2_D
    - Output is cached locally at `src/recomp/gen/` (gitignored): **27,758 functions, 70 C files, 0 lift failures, full x87-window annotations**.
    - Compressed archive also exists on Windows host at `C:\Users\Parkpoom_p\AppData\Local\nfsu2-r36s\gen_v10.tar.gz` (`85.3 MB`), and `pcrecomp` patched checkout at `C:\Users\Parkpoom_p\AppData\Local\nfsu2-r36s\pcrecomp`.
 2. **R36H Device State (`192.168.1.19` / `playos.local`)**:
-   - `g++ 14.2.0` is installed.
-   - `/roms/build/nfsu2-recompiled-r36s` contains the Phase 1 runtime source + `src/recomp/gen/` (already converted to Unix LF) and `/roms/build/pcrecomp/runtime/recomp32`.
-   - `/roms/.build_swap` (2 GB) exists on disk but is currently **turned off (`swapoff`)**; all `gcc`/`cc1` processes were cleanly stopped.
-   - Only **4 of ~110** guest objects (`build/guest-objs/v10/*.o`) were compiled on-device before stopping.
-3. **Why On-Device Guest Compilation Was Paused**:
-   - Running `JOBS=2` on R36H (895 MB RAM) caused two `cc1` instances to spill `~1.1 GB` into SD-card swap, slowing compilation to `~15 min/file` (~6–10 hours total).
-   - Note: `guest-objs-v10.tar.gz` is not publicly hosted on GitHub releases (`404`), so guest `.o` files must be compiled once from `src/recomp/gen/`.
+   - **Cleaned up completely**: `/roms/.build_swap` (2 GB), `/roms/build/` (734 MB), `g++` packages, and `apt` cache/lists have been removed.
+   - Free space restored: `/` = `1.1 GB` free (`89%`), `/roms` = `3.3 GB` free (`84%`).
+   - Do **not** compile guest objects on R36H (895 MB RAM causes heavy SD-card swap thrashing); build on a Linux host instead.
 
 ---
 
-## 4. Recommended Next Steps
+## 4. Recommended Next Steps (Linux Host Build)
 
-### Step 1: Build `guest-objs/v10/*.o` Once (Fastest Path — No Docker/WSL Needed)
-- **Option A (Recommended, ~5–8 min on Windows PC):**
-  1. Download the official portable **ARM GNU Toolchain for Windows** (`arm-gnu-toolchain-*-mingw-w64-i686-aarch64-none-linux-gnu.zip`).
-  2. Compile `src/recomp/gen/recomp_*.c` (with the same flags and `WRAP_V10` symbol renames from `ports/r36s/build_guest_vm.sh`) in parallel across all PC CPU cores to produce Linux ELF64 AArch64 `.o` files.
-  3. Upload the resulting `guest-objs/v10/*.o` (~45 MB) to `/roms/build/nfsu2-recompiled-r36s/build/guest-objs/v10/` on R36H.
-  4. From then on, linking any runtime change on R36H via `ports/r36s/build_ci.sh` takes only **~15–25 seconds**!
-- **Option B (On-Device Overnight, `JOBS=1`):**
-  - Enable swap (`sudo /sbin/swapon /roms/.build_swap`) and run `build_guest_vm.sh` with **`JOBS=1`** (keeps single `cc1` mostly in RAM, avoiding SD swap thrashing).
+### Step 1: Build `nfsu2.aarch64.v10` on Linux
+- **Option A (Recommended — Native Linux via `build.py --native`):**
+  1. Checkout branch `perf/gl-vao-uniforms` on the Linux build machine.
+  2. Run `python3 build.py /path/to/SPEED2.EXE --native --export-guest` (builds `guest-objs-v10.tar.gz` + `nfsu2.aarch64` in minutes using all Linux CPU cores; subsequent runtime-only edits link in seconds via `ports/r36s/build_ci.sh`).
+- **Option B (Linux with Docker):**
+  - Run `python3 build.py /path/to/SPEED2.EXE --export-guest` (uses the official Ubuntu 22.04 ARM64 cross-compile container).
 
 ### Step 2: Link & A/B Benchmark Phase 1 on R36H
 1. Link `nfsu2.aarch64.v10` using `ports/r36s/build_ci.sh` (`NFS_EXE_VARIANT=1 OUT_NAME=nfsu2.aarch64.v10`).
