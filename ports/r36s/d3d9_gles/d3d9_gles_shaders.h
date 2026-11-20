@@ -664,23 +664,31 @@ public:
     }
 
     // --- register files (D3D9 semantics: state is per device, independent of the bound shader) ---
-    // m_vsGen / m_psGen change with every write: a draw whose program already gathered the current
-    // generation skips uploadPacked (gather, compare) entirely.
-    void setVSConstantF(UINT start, const float* data, UINT count) { copyRegs(m_vsF, kMaxFloatRegs, start, data, count); ++m_vsGen; }
-    void setPSConstantF(UINT start, const float* data, UINT count) { copyRegs(m_psF, kMaxFloatRegs, start, data, count); ++m_psGen; }
+    // m_vsGen / m_psGen only advance when values actually change: redundant constant writes
+    // skip uploadPacked (gather, compare) completely.
+    void setVSConstantF(UINT start, const float* data, UINT count) { if (copyRegs(m_vsF, kMaxFloatRegs, start, data, count)) ++m_vsGen; }
+    void setPSConstantF(UINT start, const float* data, UINT count) { if (copyRegs(m_psF, kMaxFloatRegs, start, data, count)) ++m_psGen; }
     void getVSConstantF(UINT start, float* out, UINT count) const { readRegs(m_vsF, kMaxFloatRegs, start, out, count); }
     void getPSConstantF(UINT start, float* out, UINT count) const { readRegs(m_psF, kMaxFloatRegs, start, out, count); }
-    void setVSConstantI(UINT start, const int* data, UINT count) { copyRegs(m_vsI, kMaxIntRegs, start, data, count); ++m_vsGen; }
-    void setPSConstantI(UINT start, const int* data, UINT count) { copyRegs(m_psI, kMaxIntRegs, start, data, count); ++m_psGen; }
+    void setVSConstantI(UINT start, const int* data, UINT count) { if (copyRegs(m_vsI, kMaxIntRegs, start, data, count)) ++m_vsGen; }
+    void setPSConstantI(UINT start, const int* data, UINT count) { if (copyRegs(m_psI, kMaxIntRegs, start, data, count)) ++m_psGen; }
     void getVSConstantI(UINT start, int* out, UINT count) const { readRegs(m_vsI, kMaxIntRegs, start, out, count); }
     void getPSConstantI(UINT start, int* out, UINT count) const { readRegs(m_psI, kMaxIntRegs, start, out, count); }
     void setVSConstantB(UINT start, const BOOL* data, UINT count) {
-        for (UINT i = 0; i < count && start + i < kMaxBoolRegs; ++i) m_vsB[start + i] = data[i] ? 1 : 0;
-        ++m_vsGen;
+        bool changed = false;
+        for (UINT i = 0; i < count && start + i < kMaxBoolRegs; ++i) {
+            const int v = data[i] ? 1 : 0;
+            if (m_vsB[start + i] != v) { m_vsB[start + i] = v; changed = true; }
+        }
+        if (changed) ++m_vsGen;
     }
     void setPSConstantB(UINT start, const BOOL* data, UINT count) {
-        for (UINT i = 0; i < count && start + i < kMaxBoolRegs; ++i) m_psB[start + i] = data[i] ? 1 : 0;
-        ++m_psGen;
+        bool changed = false;
+        for (UINT i = 0; i < count && start + i < kMaxBoolRegs; ++i) {
+            const int v = data[i] ? 1 : 0;
+            if (m_psB[start + i] != v) { m_psB[start + i] = v; changed = true; }
+        }
+        if (changed) ++m_psGen;
     }
     void getVSConstantB(UINT start, BOOL* out, UINT count) const {
         for (UINT i = 0; i < count && start + i < kMaxBoolRegs; ++i) out[i] = m_vsB[start + i];
@@ -818,10 +826,14 @@ public:
 
 private:
     template <typename T>
-    static void copyRegs(T* file, int maxRegs, UINT start, const T* data, UINT count) {
-        if (!data || start >= static_cast<UINT>(maxRegs)) return;
+    static bool copyRegs(T* file, int maxRegs, UINT start, const T* data, UINT count) {
+        if (!data || !count || start >= static_cast<UINT>(maxRegs)) return false;
         if (start + count > static_cast<UINT>(maxRegs)) count = maxRegs - start;
-        std::memcpy(file + start * 4, data, count * 4 * sizeof(T));
+        T* dst = file + start * 4;
+        const size_t bytes = count * 4 * sizeof(T);
+        if (std::memcmp(dst, data, bytes) == 0) return false;
+        std::memcpy(dst, data, bytes);
+        return true;
     }
     template <typename T>
     static void readRegs(const T* file, int maxRegs, UINT start, T* out, UINT count) {
@@ -842,35 +854,64 @@ private:
         const GLint il = vertex ? lp.vsIntLoc : lp.psIntLoc;
         const GLint bl = vertex ? lp.vsBoolLoc : lp.psBoolLoc;
 
-        m_scratchF.assign(fs.size(), 0.0f);
-        m_scratchI.assign(is.size(), 0);
-        m_scratchB.assign(bs.size(), 0);
+        const bool hasF = (fl != -1 && !fs.empty());
+        const bool hasI = (il != -1 && !is.empty());
+        const bool hasB = (bl != -1 && !bs.empty());
+        if (!hasF && !hasI && !hasB) return;
+
+        if (hasF) m_scratchF.resize(fs.size());
+        if (hasI) m_scratchI.resize(is.size());
+        if (hasB) m_scratchB.resize(bs.size());
+
         size_t fo = 0, io = 0, bo = 0;
         for (const auto& u : sv->uniforms) {
-            for (int r = 0; r < u.registerCount; ++r) {
-                const int reg = u.registerIndex + r;
-                if (u.type == MOJOSHADER_UNIFORM_FLOAT) {
-                    if (reg < kMaxFloatRegs && fo + 4 <= m_scratchF.size()) std::memcpy(&m_scratchF[fo], &F[reg * 4], 16);
-                    fo += 4;
-                } else if (u.type == MOJOSHADER_UNIFORM_INT) {
-                    if (reg < kMaxIntRegs && io + 4 <= m_scratchI.size()) std::memcpy(&m_scratchI[io], &I[reg * 4], 16);
-                    io += 4;
-                } else if (u.type == MOJOSHADER_UNIFORM_BOOL) {
-                    if (reg < kMaxBoolRegs && bo < m_scratchB.size()) m_scratchB[bo] = B[reg];
-                    bo += 1;
+            const int reg = u.registerIndex;
+            const int cnt = u.registerCount;
+            if (u.type == MOJOSHADER_UNIFORM_FLOAT) {
+                if (hasF && reg < kMaxFloatRegs && fo < m_scratchF.size()) {
+                    const int avail = std::min(cnt, kMaxFloatRegs - reg);
+                    const size_t maxFloats = (m_scratchF.size() - fo) / 4;
+                    const int copyCnt = std::min(avail, static_cast<int>(maxFloats));
+                    if (copyCnt > 0) std::memcpy(&m_scratchF[fo], &F[reg * 4], static_cast<size_t>(copyCnt) * 16);
+                    if (copyCnt < cnt) {
+                        const size_t rem = std::min(static_cast<size_t>(cnt - copyCnt) * 4, m_scratchF.size() - (fo + static_cast<size_t>(copyCnt) * 4));
+                        if (rem > 0) std::memset(&m_scratchF[fo + static_cast<size_t>(copyCnt) * 4], 0, rem * sizeof(float));
+                    }
+                }
+                fo += static_cast<size_t>(cnt) * 4;
+            } else if (u.type == MOJOSHADER_UNIFORM_INT) {
+                if (hasI && reg < kMaxIntRegs && io < m_scratchI.size()) {
+                    const int avail = std::min(cnt, kMaxIntRegs - reg);
+                    const size_t maxInts = (m_scratchI.size() - io) / 4;
+                    const int copyCnt = std::min(avail, static_cast<int>(maxInts));
+                    if (copyCnt > 0) std::memcpy(&m_scratchI[io], &I[reg * 4], static_cast<size_t>(copyCnt) * 16);
+                    if (copyCnt < cnt) {
+                        const size_t rem = std::min(static_cast<size_t>(cnt - copyCnt) * 4, m_scratchI.size() - (io + static_cast<size_t>(copyCnt) * 4));
+                        if (rem > 0) std::memset(&m_scratchI[io + static_cast<size_t>(copyCnt) * 4], 0, rem * sizeof(int));
+                    }
+                }
+                io += static_cast<size_t>(cnt) * 4;
+            } else if (u.type == MOJOSHADER_UNIFORM_BOOL) {
+                if (hasB) {
+                    for (int r = 0; r < cnt; ++r) {
+                        if (bo < m_scratchB.size()) m_scratchB[bo] = (reg + r < kMaxBoolRegs) ? B[reg + r] : 0;
+                        ++bo;
+                    }
+                } else {
+                    bo += static_cast<size_t>(cnt);
                 }
             }
         }
-        if (fl != -1 && !fs.empty() && (force || std::memcmp(fs.data(), m_scratchF.data(), fs.size() * sizeof(float)) != 0)) {
-            fs = m_scratchF;
+        if (hasF && (force || std::memcmp(fs.data(), m_scratchF.data(), fs.size() * sizeof(float)) != 0)) {
+            fs.swap(m_scratchF);
             glUniform4fv(fl, static_cast<GLsizei>(fs.size() / 4), fs.data());
         }
-        if (il != -1 && !is.empty() && (force || std::memcmp(is.data(), m_scratchI.data(), is.size() * sizeof(int)) != 0)) {
-            is = m_scratchI;
+        if (hasI && (force || std::memcmp(is.data(), m_scratchI.data(), is.size() * sizeof(int)) != 0)) {
+            is.swap(m_scratchI);
             glUniform4iv(il, static_cast<GLsizei>(is.size() / 4), is.data());
         }
-        if (bl != -1 && !bs.empty() && (force || std::memcmp(bs.data(), m_scratchB.data(), bs.size() * sizeof(int)) != 0)) {
-            bs = m_scratchB;
+        if (hasB && (force || std::memcmp(bs.data(), m_scratchB.data(), bs.size() * sizeof(int)) != 0)) {
+            bs.swap(m_scratchB);
             glUniform1iv(bl, static_cast<GLsizei>(bs.size()), bs.data());
         }
     }
