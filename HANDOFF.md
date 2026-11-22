@@ -88,29 +88,50 @@ Measured on physical R36H with `nfsu2.cfg` set to `NFSU2_GRAPHICS=performance`, 
 
 ---
 
-## 4. Next Steps — Phase 3: Backlog #2 (`sub_005BC940` & `sub_005BDAF0` Native Port in `world_cull.c`)
+## 4. Remaining Optimization Roadmap (Target Scope: Group 1 & Group 2)
 
-Target the remaining non-replayed group & item setup bottleneck on the Game Thread (**Backlog #2**: `sub_005BC940` `3.3%` + `sub_005BDAF0` and related helpers `2.6%`, `~6%` combined of game-thread busy time, `34–48` full groups and `~72–104` commit-run items per frame):
+User-approved remaining optimization scope focuses on **Group 1** (zero-tradeoff native C runtime ports) and **Group 2** (high-gain configurable trade-off toggles). Low-ROI / full-guest-recompile items (Group 3: Backlog #17 ThinLTO, #9 compiler flags, #6/#7 minor icall/x87 tweaks, #12 sound mixer) are skipped.
+
+---
+
+### Group 1 (Phase 3) — Zero-Tradeoff Native Runtime Porting (Backlog #2 & #4)
+
+Target the remaining non-replayed group & item setup bottleneck on the Game Thread (**Backlog #2**: `sub_005BC940` `3.3%` + `sub_005BDAF0` and related helpers `2.6%`; **Backlog #4**: native `CommitChanges` and parameter application in open passes `1–3%` — `~6–8%` combined of game-thread busy time across `34–48` full groups and `~72–104` commit-run items per frame):
 
 1. **Architecture Advantage (Zero Guest-Object Rebuild Needed):**
-   - `nativeFlush()` in `src/runtime/world_cull.c` already invokes these lifted functions directly via `ccall()`:
+   - `nativeFlush()` in `src/runtime/world_cull.c` already invokes these lifted functions directly via `ccall()` / `fxMethod()`:
      - Line 1100 (full/non-replayed group material setup): `ccall(sub_005BC940, 1, a)`
      - Lines 355–366 (`paramCalls(uint32_t it)` for full & commit-run items):
        - `ccall(sub_005BDAF0, 2, a)` — world/view/projection matrices & effect parameters from `(M32(it + 0x24), view)`
        - `ccall(sub_005BD7B0, 2, a)` — shadow/projected view 9 matrix parameters (when `M32(M32(M32(it + 0x18) + 0x1c) + 0x59c) != 0`)
        - `ccall(sub_005BCE50, 2, a)` — per-item light context setup (`M32(it + 0x1c)`)
        - `ccall(sub_005BD1B0, 2, a)` — per-item texture override setup (`M32(it + 0x20)`)
-   - Therefore, replacing these `ccall(...)` sites in `src/runtime/world_cull.c` with native C implementations requires **only the 20-second fast Docker relink (`ports/r36s/build_cross.sh`)** against the cached `/work/guest-v10` objects.
+     - Line 524 (`commitRunItem(uint32_t it, RunState* rs)`): `fxMethod(fx, 67, 1, a)` (`ID3DXEffect::CommitChanges` inside an open pass)
+   - Replacing these sites in `src/runtime/world_cull.c` / `src/runtime/fx_cache.c` with native C implementations requires **only the 20-second fast Docker relink (`ports/r36s/build_cross.sh`)** against the cached `/work/guest-v10` objects.
 
-2. **Implementation Plan for Next Session:**
+2. **Implementation Plan (Group 1):**
    - **Step 1 — Extract Lifted C from `nfsu2-r36s-work`:**
-     - Extract `sub_005BC940`, `sub_005BDAF0`, `sub_005BD7B0`, `sub_005BCE50`, and `sub_005BD1B0` from `/work/guest-v10/recomp_*.c` inside `nfsu2-r36s-work` (and inspect their disassembly in `SPEED2.EXE`).
-   - **Step 2 — Port to Native C in `src/runtime/world_cull.c`:**
-     - Extend `replaySetup(uint32_t mat)` (lines 881–916 of `world_cull.c`, which already implements the render-state and blend/alpha globals portion of `sub_005BC940`) into a full native `fullMaterialSetup(uint32_t mat)` that also sets the effect texture/parameter handles and updates `M32(0x870940) = mat`.
-     - Port `sub_005BDAF0` (and `sub_005BCE50` / `sub_005BD1B0` / `sub_005BD7B0`) in `paramCalls(uint32_t it)` to compute the W/WV/WVP matrix products in native C (calling `nfs_fx_param_set` / effect parameter write helpers directly).
+     - Extract `sub_005BC940`, `sub_005BDAF0`, `sub_005BD7B0`, `sub_005BCE50`, `sub_005BD1B0`, and `sub_0066A93B` (`CommitChanges`) from `/work/guest-v10/recomp_*.c` inside `nfsu2-r36s-work` (and inspect their disassembly in `SPEED2.EXE`).
+   - **Step 2 — Port to Native C in `src/runtime/world_cull.c` & `src/runtime/fx_cache.c`:**
+     - **Backlog #2:** Extend `replaySetup(uint32_t mat)` (lines 881–916 of `world_cull.c`) into a full native `fullMaterialSetup(uint32_t mat)` that also sets effect texture/parameter handles and updates `M32(0x870940) = mat`; port `sub_005BDAF0` (and `sub_005BCE50` / `sub_005BD1B0` / `sub_005BD7B0`) in `paramCalls(uint32_t it)` to compute W/WV/WVP matrix products in native C.
+     - **Backlog #4:** Implement native `CommitChanges` in open passes (`commitRunItem`) to apply only dirty changed parameters/constants without guest vtable/lifted dispatch overhead.
    - **Step 3 — Add Verify Mode (`NFSU2_NATIVE_SETUP=0/1/2`):**
      - `0` = lifted `ccall(...)`
      - `1` = native C (default)
      - `2` = verify: compare memory state, effect parameter buffers, and captured D3D calls between native C and lifted `ccall(...)` (`[NFSU2 SETUP] verify`).
    - **Step 4 — Fast Relink & R36H Benchmark:**
      - Relink `nfsu2-v10.aarch64` in ~20s via Docker (`nfsu2-runtime-relink-verify` skill), verify `0 bad` with `NFSU2_NATIVE_SETUP=2` on R36H, then measure game-thread CPU ms/frame reduction.
+
+---
+
+### Group 2 (Phase 4) — High-Gain Configurable Trade-off Toggles (Backlog #13, #15, #14)
+
+Implement as configurable environment variables / `nfsu2.cfg` options so users can enable them for locked 30 FPS in heavy city/race scenes:
+
+1. **Backlog #13 — Half-Rate Car Reflection Map Update (`5–10%` Game + Render Thread Saving, Complexity `3/10`):**
+   - **Mechanism:** Update the car environment reflection render target (`view` / reflection pass) every other frame (`30 Hz → 15 Hz`, controlled via `NFSU2_HALF_REFLECT=1`, `0` off) while reusing the previous frame's reflection texture on skipped frames.
+   - **Why Highest Priority in Group 2:** Cuts both the game-thread scene walk/submission and the render-thread draw calls for the reflection pass in half, with negligible visual difference on the 3.5" 640×480 screen.
+2. **Backlog #15 — Fewer Particles / Crowd Toggle (`2–5%` Game + Render Thread Saving, Complexity `2/10`):**
+   - **Mechanism:** Expose clean runtime/config toggles for crowd disable (`g_CrowdEnable=0`) and particle density throttling (`NFSU2_PARTICLE_SKIP` or cap).
+3. **Backlog #14 — Lower Physics / AI Update Rate for Distant Cars (`5–10%` Game Thread Saving, Complexity `5/10`):**
+   - **Mechanism:** Identify distant AI/traffic car simulation steps beyond a distance threshold and throttle non-visible/distant update frequency (`NFSU2_DISTANT_AI_RATE`), preserving full physics rate for the player and nearby opponents.
