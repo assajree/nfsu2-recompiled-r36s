@@ -207,7 +207,7 @@ fi
 GPU_EXTRAS=""
 [ "$NFSU2_GPU_EXTRAS" = "1" ] && GPU_EXTRAS="g_TextureFiltering=2;g_TintingEnable=1;g_CarLodLevel=1"
 export NFSU2_REGISTRY="$COMMON;$PROFILE${GPU_EXTRAS:+;$GPU_EXTRAS}${NFSU2_REGISTRY_EXTRA:+;$NFSU2_REGISTRY_EXTRA}"
-CAP_ARG="--cap60"; [ "$NFSU2_FPS" = "30" ] && CAP_ARG="--cap30"
+CAP_ARG="--cap=${NFSU2_FPS:-30}"
 
 # Record the clocks actually in effect (launcher.log next to log.txt)
 {
