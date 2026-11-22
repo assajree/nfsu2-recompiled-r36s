@@ -88,7 +88,29 @@ Measured on physical R36H with `nfsu2.cfg` set to `NFSU2_GRAPHICS=performance`, 
 
 ---
 
-## 4. Remaining Optional / Upstream Tasks
+## 4. Next Steps — Phase 3: Backlog #2 (`sub_005BC940` & `sub_005BDAF0` Native Port in `world_cull.c`)
 
-1. **Backlog #2 / #4:** Native setup for remaining non-replayed world groups (`sub_005BC940` 3.3%, `sub_005BDAF0` 2.6%) or native `CommitChanges` in open passes (`1–3%`).
-2. **Downstream Packaging:** When ready to package for R36H distribution (`dist/*.zip`), apply downstream binary patchers (`patch_subtitles.py`, `patch_video.py`, `patch_gps.py`) to `nfsu2.aarch64.v10`.
+Target the remaining non-replayed group & item setup bottleneck on the Game Thread (**Backlog #2**: `sub_005BC940` `3.3%` + `sub_005BDAF0` and related helpers `2.6%`, `~6%` combined of game-thread busy time, `34–48` full groups and `~72–104` commit-run items per frame):
+
+1. **Architecture Advantage (Zero Guest-Object Rebuild Needed):**
+   - `nativeFlush()` in `src/runtime/world_cull.c` already invokes these lifted functions directly via `ccall()`:
+     - Line 1100 (full/non-replayed group material setup): `ccall(sub_005BC940, 1, a)`
+     - Lines 355–366 (`paramCalls(uint32_t it)` for full & commit-run items):
+       - `ccall(sub_005BDAF0, 2, a)` — world/view/projection matrices & effect parameters from `(M32(it + 0x24), view)`
+       - `ccall(sub_005BD7B0, 2, a)` — shadow/projected view 9 matrix parameters (when `M32(M32(M32(it + 0x18) + 0x1c) + 0x59c) != 0`)
+       - `ccall(sub_005BCE50, 2, a)` — per-item light context setup (`M32(it + 0x1c)`)
+       - `ccall(sub_005BD1B0, 2, a)` — per-item texture override setup (`M32(it + 0x20)`)
+   - Therefore, replacing these `ccall(...)` sites in `src/runtime/world_cull.c` with native C implementations requires **only the 20-second fast Docker relink (`ports/r36s/build_cross.sh`)** against the cached `/work/guest-v10` objects.
+
+2. **Implementation Plan for Next Session:**
+   - **Step 1 — Extract Lifted C from `nfsu2-r36s-work`:**
+     - Extract `sub_005BC940`, `sub_005BDAF0`, `sub_005BD7B0`, `sub_005BCE50`, and `sub_005BD1B0` from `/work/guest-v10/recomp_*.c` inside `nfsu2-r36s-work` (and inspect their disassembly in `SPEED2.EXE`).
+   - **Step 2 — Port to Native C in `src/runtime/world_cull.c`:**
+     - Extend `replaySetup(uint32_t mat)` (lines 881–916 of `world_cull.c`, which already implements the render-state and blend/alpha globals portion of `sub_005BC940`) into a full native `fullMaterialSetup(uint32_t mat)` that also sets the effect texture/parameter handles and updates `M32(0x870940) = mat`.
+     - Port `sub_005BDAF0` (and `sub_005BCE50` / `sub_005BD1B0` / `sub_005BD7B0`) in `paramCalls(uint32_t it)` to compute the W/WV/WVP matrix products in native C (calling `nfs_fx_param_set` / effect parameter write helpers directly).
+   - **Step 3 — Add Verify Mode (`NFSU2_NATIVE_SETUP=0/1/2`):**
+     - `0` = lifted `ccall(...)`
+     - `1` = native C (default)
+     - `2` = verify: compare memory state, effect parameter buffers, and captured D3D calls between native C and lifted `ccall(...)` (`[NFSU2 SETUP] verify`).
+   - **Step 4 — Fast Relink & R36H Benchmark:**
+     - Relink `nfsu2-v10.aarch64` in ~20s via Docker (`nfsu2-runtime-relink-verify` skill), verify `0 bad` with `NFSU2_NATIVE_SETUP=2` on R36H, then measure game-thread CPU ms/frame reduction.
