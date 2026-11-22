@@ -499,6 +499,11 @@ void sub_005BC010(void) {
     g_eax = r;
     g_esp += 16;  /* ret 0xc */
 }
+int nfs_frustum_direct(uint32_t self, uint32_t A, uint32_t B, uint32_t Mx, uint32_t* out) {
+    if (mode() != 1) return 0;
+    *out = frustumTest(self, A, B, Mx);
+    return 1;
+}
 
 /* Local x87 window verification (arm64_guest.h NFS_LW_CHECK builds): a call whose real depth change differs
  * from the one ports/r36s/lw/analyze.py assumed. The first 64 are logged; NFSU2 LW summary every 600. */

@@ -18,13 +18,18 @@
  *                 texture and shader choice, sub_005CE860; texture swaps off.
  *   sub_005D6700  walk the scenery tree for one view (thiscall: view): box tests down the nodes (stack of
  *                 nodes with their visibility), sub_005D62C0 for each object of a visible node.
- * Verify mode: sub_00440EA0 / sub_005CE860 write natively with an undo log, undo, run the lifted function and
- * compare every logged address and the registers; sub_005C5600 / sub_005D6700 compute their calls without
- * making them (the texture swap calls are made, then undone by the lifted run's own pair) and compare them with
- * the calls the lifted function makes.
+ *   sub_005D62C0  scenery object setup (thiscall, 3 arguments: objIdx, view, vis): precull bitmap, view flags,
+ *                 AABB frustum test, apparent pixel-size / LOD selection (sub_005D6220), static and placed
+ *                 instance matrix unpack (sub_00401EA0 / sub_005D5F90 / sub_005D5F60) into [view+0x4C].
+ *                 Rare animated-rotation or light-flare objects fall back to sub_005D62C0_orig.
+ * Verify mode: sub_00440EA0 / sub_005CE860 / sub_005D62C0 write natively with an undo log, undo, run the lifted
+ * function and compare every logged address and the registers; sub_005C5600 / sub_005D6700 compute their calls
+ * without making them (the texture swap calls are made, then undone by the lifted run's own pair) and compare
+ * them with the calls the lifted function makes.
  */
 #include "recomp_types.h"
 #include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,12 +41,14 @@ extern void sub_005C5600_orig(void);
 extern void sub_005D6700_orig(void);
 extern void sub_005D62C0_orig(void);
 extern void sub_005BC010(void);   /* frustum test (native_math.c) */
+extern int nfs_frustum_direct(uint32_t self, uint32_t A, uint32_t B, uint32_t Mx, uint32_t* out);
 extern void sub_00490560(void);   /* texture swaps on */
 extern void sub_00488DD0(void);   /* texture swaps off */
 extern uint32_t getD3D9PresentCount(void);
 #define M8(a) (*(uint8_t*)ADDR(a))
 #define M16(a) (*(uint16_t*)ADDR(a))
 #define M32(a) (*(uint32_t*)ADDR(a))
+#define MF(a) (*(float*)ADDR(a))
 
 static int g_mode = -1;
 static inline int mode(void) {
@@ -79,21 +86,23 @@ static inline uint32_t calleePops(void (*fn)(void), uint32_t self, int n, const 
     return g_eax;
 }
 static inline uint32_t frustum(uint32_t self, uint32_t mn, uint32_t mx, uint32_t xform) {
+    uint32_t r;
+    if (nfs_frustum_direct(self, mn, mx, xform, &r)) return r;
     const uint32_t a[3] = {mn, mx, xform};
     return calleePops(sub_005BC010, self, 3, a);
 }
 
 /* ---- verify support ---- */
-static uint32_t vCalls[4], vBad[4];
-static const char* const vName[4] = {"pool", "item", "model", "walk"};
+static uint32_t vCalls[5], vBad[5];
+static const char* const vName[5] = {"pool", "item", "model", "walk", "obj"};
 static void verifyReport(void) {
     static uint32_t f;
     const uint32_t now = getD3D9PresentCount();
     if (now == f) return;
     f = now;
     if (now % 600 == 0)
-        printf("[NFSU2 SCENE] verify: pool %u/%u bad, item %u/%u, model %u/%u, walk %u/%u\n",
-               vCalls[0], vBad[0], vCalls[1], vBad[1], vCalls[2], vBad[2], vCalls[3], vBad[3]);
+        printf("[NFSU2 SCENE] verify: pool %u/%u bad, item %u/%u, model %u/%u, walk %u/%u, obj %u/%u\n",
+               vCalls[0], vBad[0], vCalls[1], vBad[1], vCalls[2], vBad[2], vCalls[3], vBad[3], vCalls[4], vBad[4]);
 }
 static void bad(int k, const char* what, uint32_t a, uint32_t native, uint32_t lifted) {
     if (vBad[k]++ < 12) printf("[NFSU2 SCENE] %s mismatch: %s %08x native %08x lifted %08x\n", vName[k], what, a, native, lifted);
@@ -107,12 +116,12 @@ static inline void W32(uint32_t a, uint32_t v) {
     M32(a) = v;
 }
 static void undoLog(void) { for (int i = nlog - 1; i >= 0; --i) M32(wlog[i].a) = wlog[i].old; }
-static void checkLog(int k) {
-    if (nlog >= WLOG_MAX) { bad(k, "write log full", 0, 0, 0); return; }
+static void checkLog(int k, int nl) {
+    if (nl >= WLOG_MAX) { bad(k, "write log full", 0, 0, 0); return; }
     /* the last native write of each address against the lifted function's result */
-    for (int i = 0; i < nlog; ++i) {
+    for (int i = 0; i < nl; ++i) {
         int last = 1;
-        for (int j = i + 1; j < nlog; ++j) if (wlog[j].a == wlog[i].a) { last = 0; break; }
+        for (int j = i + 1; j < nl; ++j) if (wlog[j].a == wlog[i].a) { last = 0; break; }
         if (last && M32(wlog[i].a) != wlog[i].val) bad(k, "write", wlog[i].a, wlog[i].val, M32(wlog[i].a));
     }
 }
@@ -146,13 +155,14 @@ void sub_00440EA0(void) {
         nlog = 0;
         const uint32_t blk = poolAlloc(pool);
         const uint32_t ecx = poolEcx(pool, next);
+        const int nl = nlog;
         undoLog();
+        nlog = -1;
         sub_00440EA0_orig();
         ++vCalls[0];
-        checkLog(0);
+        checkLog(0, nl);
         if (g_eax != blk) bad(0, "eax", pool, blk, g_eax);
         if (g_ecx != ecx) bad(0, "ecx", pool, ecx, g_ecx);
-        nlog = -1;
         verifyReport();
         return;
     }
@@ -208,12 +218,13 @@ void sub_005CE860(void) {
         nlog = 0;
         addItemNative(a);
         const uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
+        const int nl = nlog;
         undoLog();
+        nlog = -1;
         sub_005CE860_orig();
         ++vCalls[1];
-        checkLog(1);
+        checkLog(1, nl);
         if (g_eax != eax || g_ecx != ecx || g_edx != edx) bad(1, "registers", a[0], eax ^ ecx ^ edx, g_eax ^ g_ecx ^ g_edx);
-        nlog = -1;
         verifyReport();
         return;
     }
@@ -332,15 +343,159 @@ static void modelEntry(void) {
     g_esp = sp + 0x18;   /* ret 0x14 */
 }
 
-/* ---- sub_005D6700: scenery tree walk ---- */
+/* ---- sub_005D62C0: scenery object setup & sub_005D6700: scenery tree walk ---- */
 static int capWalk = 0;
 static uint32_t walkList[CAP_MAX][4]; static int walkN;
-void sub_005D62C0(void) {   /* only to record the calls in verify mode */
+/* sub_005D6220(view, pos, rad): apparent pixel size of a bounding sphere */
+static int32_t pixelSize(uint32_t view, uint32_t pos, float rad) {
+    const double r = (double)rad;
+    const double dx = (double)MF(pos)     - (double)MF(view + 0x60);
+    const double dy = (double)MF(pos + 4) - (double)MF(view + 0x64);
+    const double dz = (double)MF(pos + 8) - (double)MF(view + 0x68);
+    double dot = dz * (double)MF(view + 0x78);
+    dot += dy * (double)MF(view + 0x74);
+    dot += dx * (double)MF(view + 0x70);
+    if (-r > dot) return 0;
+    const double d2 = (dx * dx + dz * dz) + dy * dy;
+    const float dist = (float)(sqrt(d2) - r);
+    double s = (double)MF(view + 0x80);
+    if ((double)dist > r) {
+        s /= (double)dist;
+        s *= r;
+    }
+    if (!(s == s)) return 0;
+    if (s >= 9223372036854775808.0) return (int32_t)(uint32_t)INT64_MAX;
+    if (s < -9223372036854775808.0) return (int32_t)(uint32_t)INT64_MIN;
+    return (int32_t)(uint32_t)(int64_t)s;
+}
+/* returns 1 if handled natively, 0 if rare animated-rotation / flare path should run sub_005D62C0_orig */
+static int sceneObject(uint32_t self, uint32_t objIdx, uint32_t view, uint32_t vis) {
+    const uint32_t obj = M32(self + 0x20) + (objIdx << 6);
+    const int32_t visIdx = (int32_t)M32(view + 0x84);
+    if (visIdx >= 0) {
+        const uint32_t byteOff = (M32(obj + 0x1C) << 7) + (uint32_t)(visIdx >> 3);
+        if (M8(M32(self + 0x30) + byteOff) & (uint8_t)(1u << (visIdx & 7))) return 1;
+    }
+    if (M8(view + 0x44) & (uint8_t)(M16(obj + 0x1A) ^ 0x60u)) return 1;
+    const uint32_t info = M32(self + 0x18) + (uint32_t)((int32_t)(int16_t)M16(obj + 0x18) * 0x44);
+    if (vis == 1) {
+        vis = frustum(M32(view + 0x40), obj, obj + 0xC, 0);
+        if (!vis) return 1;
+    }
+    const float rad = (float)(6.0 + (double)MF(info + 0x3C));
+    const int32_t pix = pixelSize(view, obj + 0x20, rad);
+    if (pix <= 1) return 1;
+    const uint32_t vflags = M32(view + 0x44);
+    uint32_t model = 0;
+    if (vflags & 0x1800u) {
+        if (pix < 0x20) return 1;
+        model = M32(info + ((M8(obj + 0x1B) & 4) ? 0x34u : 0x38u));
+    } else if (vflags & 0x20u) {
+        if (pix < 0x10) return 1;
+        model = M32(info + 0x34);
+    } else if ((int32_t)M32(0x8707DC) >= 3) {
+        if (pix < 0x17) return 1;
+        model = M32(info + 0x34);
+    } else {
+        if (pix < 0x11) return 1;
+        const uint32_t m0 = M32(info + 0x30);
+        double v = 0.0;
+        if (m0) {
+            const uint32_t c = M32(m0 + 0xC);
+            if (c) {
+                if ((int16_t)M16(c + 0x14) < 0x28) {
+                    v = 4.0;
+                } else {
+                    const double c94 = (double)MF(c + 0x94);
+                    if (c94 > 0.0) {
+                        v = (double)MF(c + 0x98);
+                        if (v < 6.0) v = 6.0;
+                        v = (double)pix / v;
+                    }
+                }
+            }
+        }
+        const uint32_t cf4 = M32(0x870CF4);
+        if (v >= 4.0 && (cf4 == 2 || cf4 == 3)) model = m0;
+        else model = M32(info + 0x34);
+    }
+    if (!model) return 1;
+    if (M8(obj + 0x1B) & 1) {
+        const uint32_t cur = M32(view + 0x4C);
+        if (cur < M32(view + 0x50)) {
+            W32(view + 0x4C, cur + 0xC);
+            W32(cur, model + vis);
+            W32(cur + 4, 0);
+            W32(cur + 8, obj);
+        }
+        return 1;
+    }
+    const uint32_t p = M32(model + 0xC);
+    if ((vflags & 0x4000u) && p && (int8_t)M8(p + 0xE) < 0) return 0;
+    const uint32_t v40 = M32(view + 0x40);
+    if ((v40 == 0x832E50u || v40 == 0x832EC0u) && p && M32(p + 0x80) && M8(p + 0x1B)) return 0;
+    const uint32_t mat = M32(0x82DA5C);
+    if (mat + 0x40u >= M32(0x82DA60)) {
+        W32(0x82DA6C, 1);
+        W32(0x82DA70, M32(0x82DA70) + 0x40u);
+        return 1;
+    }
+    W32(0x82DA5C, mat + 0x40u);
+    for (uint32_t r = 0; r < 3; ++r) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            float fv = (float)((double)(int16_t)M16(obj + 0x2C + r * 6 + c * 2) * 0.0001220703125);
+            if (r == 2 && c == 2 && (vflags & 0x800u)) fv = -fv;
+            uint32_t bits;
+            memcpy(&bits, &fv, 4);
+            W32(mat + r * 16 + c * 4, bits);
+        }
+        W32(mat + r * 16 + 12, 0);
+    }
+    W32(mat + 0x30, M32(obj + 0x20));
+    W32(mat + 0x34, M32(obj + 0x24));
+    W32(mat + 0x38, M32(obj + 0x28));
+    W32(mat + 0x3C, 0x3F800000u);
+    const uint32_t cur = M32(view + 0x4C);
+    if (cur >= M32(view + 0x50)) return 1;
+    W32(view + 0x4C, cur + 0xC);
+    W32(cur, model + vis);
+    W32(cur + 4, mat);
+    W32(cur + 8, obj);
+    return 1;
+}
+void sub_005D62C0(void) {
+    const uint32_t self = g_ecx, sp = g_esp;
+    const uint32_t objIdx = M32(sp + 4), view = M32(sp + 8), vis = M32(sp + 12);
     if (capWalk && walkN < CAP_MAX) {
-        walkList[walkN][0] = g_ecx; walkList[walkN][1] = M32(g_esp + 4); walkList[walkN][2] = M32(g_esp + 8); walkList[walkN][3] = M32(g_esp + 12);
+        walkList[walkN][0] = self; walkList[walkN][1] = objIdx; walkList[walkN][2] = view; walkList[walkN][3] = vis;
         ++walkN;
     }
-    sub_005D62C0_orig();
+    const int m = mode();
+    if (m == 0) { sub_005D62C0_orig(); return; }
+    if (m == 2) {
+        nlog = 0;
+        const int handled = sceneObject(self, objIdx, view, vis);
+        const uint32_t v4c = M32(view + 0x4C), da5c = M32(0x82DA5C);
+        const int nl = nlog;
+        undoLog();
+        nlog = -1;
+        g_ecx = self; g_esp = sp;
+        sub_005D62C0_orig();
+        if (handled) {
+            ++vCalls[4];
+            checkLog(4, nl);
+            if (M32(view + 0x4C) != v4c) bad(4, "view+4c", objIdx, v4c, M32(view + 0x4C));
+            if (M32(0x82DA5C) != da5c) bad(4, "82da5c", objIdx, da5c, M32(0x82DA5C));
+        }
+        verifyReport();
+        return;
+    }
+    if (!sceneObject(self, objIdx, view, vis)) {
+        g_ecx = self; g_esp = sp;
+        sub_005D62C0_orig();
+        return;
+    }
+    g_esp = sp + 16;   /* ret 0xc */
 }
 #define WALK_MAX 256
 static void sceneWalk(uint32_t self, uint32_t view, int dry) {
@@ -359,7 +514,7 @@ static void sceneWalk(uint32_t self, uint32_t view, int dry) {
             if (c >= 0) {
                 if (dry) {
                     if (walkN < CAP_MAX) { walkList[walkN][0] = self; walkList[walkN][1] = (uint32_t)c; walkList[walkN][2] = view; walkList[walkN][3] = v; ++walkN; }
-                } else {
+                } else if (!sceneObject(self, (uint32_t)c, view, v)) {
                     const uint32_t a[3] = {(uint32_t)c, view, v};
                     calleePops(sub_005D62C0_orig, self, 3, a);
                 }
