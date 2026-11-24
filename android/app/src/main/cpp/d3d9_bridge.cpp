@@ -308,6 +308,7 @@ extern "C" uint32_t getD3D9PresentCount() {
     return s_presentCount.load(std::memory_order_relaxed);
 }
 #endif
+extern "C" __attribute__((weak)) void nfs_reflect_on_present();
 static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint32_t* argumentCount){
     uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
     // Diagnostics: NFSU2_COM_HISTO=N prints how often each COM method was called every N presents.
@@ -340,6 +341,7 @@ static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint3
 #if !defined(NFS_GLES)
         s_presentCount.fetch_add(1, std::memory_order_relaxed);
 #endif
+        if(nfs_reflect_on_present)nfs_reflect_on_present();
         return kind==2?static_cast<IDirect3DDevice9*>(object)->Present(source,destination,window,dirty):
             static_cast<IDirect3DSwapChain9*>(object)->Present(source,destination,window,dirty,args[5]);
     }

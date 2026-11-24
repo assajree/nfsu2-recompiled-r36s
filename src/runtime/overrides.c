@@ -212,6 +212,13 @@ static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
 extern int nfs_fx_lazy_enabled(void);
 extern void nfs_fx_lazy_begin(void); extern void nfs_fx_lazy_begin_pass(void); extern void nfs_fx_lazy_commit(void);
 extern void nfs_fx_lazy_end_pass(void); extern void nfs_fx_lazy_end(void);
+#if NFS_EXE_VARIANT == NFS_EXE_V10
+extern int nfs_distant_ai_rate(void);
+extern void nfs_ov_physics_update(void);
+extern void nfs_ov_ai_drag(void);
+extern void nfs_ov_ai_race(void);
+extern void nfs_ov_ai_traffic(void);
+#endif
 #endif
 enum { OV_SLOTS = 256 };
 static uint32_t ovKey[OV_SLOTS]; static nfs_override_fn ovFn[OV_SLOTS];
@@ -236,6 +243,14 @@ static void ov_build(void) {
         ov_put(NFS_VA(0x006644A6), nfs_fx_lazy_begin); ov_put(NFS_VA(0x0066A9F6), nfs_fx_lazy_begin_pass);
         ov_put(NFS_VA(0x0066A93B), nfs_fx_lazy_commit); ov_put(NFS_VA(0x0065AAEC), nfs_fx_lazy_end_pass); ov_put(NFS_VA(0x0065AA06), nfs_fx_lazy_end);
     }
+#if NFS_EXE_VARIANT == NFS_EXE_V10
+    if (nfs_distant_ai_rate() >= 2) {
+        ov_put(0x005B6FF0u, nfs_ov_physics_update);
+        ov_put(0x0042DF50u, nfs_ov_ai_drag);
+        ov_put(0x0042C100u, nfs_ov_ai_race);
+        ov_put(0x00429DD0u, nfs_ov_ai_traffic);
+    }
+#endif
 #else
     /* Android: the effect Set* hooks feed the preshader cache (fx_cache.c, NFS_FX_PRESHADER_ONLY). */
 #if defined(NFS_FX_PRESHADER_ONLY)

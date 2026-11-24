@@ -44,10 +44,21 @@ Implemented and committed in `f23c3cd`:
   - Ported full material setup (`sub_005BC940` -> `fullMaterialSetup`, including UV scroll matrix at `[8]/[9]` and texture/shader state setup) and all 4 per-item parameter setters (`sub_005BDAF0`, `sub_005BD7B0`, `sub_005BCE50`, `sub_005BD1B0`) with inline SSE-matched `matMulSSE()` (guarded on `M32(0x803E74) == NFS_VA(0x00689A17)`).
   - Wired `commitChangesCall()` to `nfs_fx_commit_changes()`, with full bit-exact verification harness (`NFSU2_NATIVE_SETUP=2`) and micro-benchmark timer (`NFSU2_SETUP_TIMING=1`).
 
+### Phase 4 (Group 2) — Configurable Trade-off Toggles (Backlog #13, #15, #14)
+- **`src/runtime/hud_half.c`, `android/app/src/main/cpp/d3d9_render_thread.inc`, `android/app/src/main/cpp/d3d9_bridge.cpp`:**
+  - **Backlog #13 (`NFSU2_HALF_REFLECT`):** Added `nfs_reflect_on_present()` invoked once per `Present` on the game thread. Signature-locates the cubemap schedule table (`0x7FEE90`/`0x7FEEA0`, v10/v12 compatible), zeroes active schedule rows on skipped driving frames (disabling cubemap views `0x10..0x15` in both `sub_005B9940` and `sub_005CA7A0` while keeping `g_CarEnvironmentMapEnable` enabled so cars sample the previous cubemap with zero flicker), and rotates every face evenly on update frames. Default `0` (off); `1`/`2` = half rate, `N` = `1/N` rate; menus/garage remain full rate.
+  - **Backlog #15 (`NFSU2_CROWD`, `NFSU2_PARTICLES`):** Exposed clean independent `0|1` overrides for `g_CrowdEnable` (`0x870CD0`) and `g_ParticleSystemEnable` (`0x870CEC`) both via `NFSU2.sh` registry injection and runtime enforcement in `nfs_reflect_on_present()`.
+- **`src/runtime/hud_half.c` & `src/runtime/overrides.c`:**
+  - **Backlog #14 (`NFSU2_DISTANT_AI_RATE`, `NFSU2_DISTANT_AI_DIST`):** Added vtable-level `overrides.c` hooks (`0` guest `.o` rebuild, zero overhead when `=0` default) for `PhysicsMover::Update` (`sub_005B6FF0`) and AI controllers (`DragController` `sub_0042DF50`, `RaceCarController` `sub_0042C100`, `TrafficController` `sub_00429DD0`), strictly skipping human player `DriverClass == 1` (`RealController`). Beyond `NFSU2_DISTANT_AI_DIST` metres (default `45m`) from the player car:
+    1. Scales the internal 227 Hz physics substep `[0x7FC070]` (`0.0044s`) by `rate` (capped at `0.015s` >= 66 Hz), cutting distant AI physics substeps (e.g. `8 -> 4` at 30 FPS) while still integrating the full `dt` every frame (zero slowdown/stutter).
+    2. Staggers and skips distant AI controller ticks at `1/rate` (`(frame + (ctrl >> 4)) % rate != 0`), holding last frame's steering/throttle/brake.
+- **`ports/r36s/package/NFSU2.sh` & `ports/r36s/package/nfsu2.cfg`:**
+  - Documented and wired `NFSU2_HALF_REFLECT`, `NFSU2_CROWD`, `NFSU2_PARTICLES`, `NFSU2_DISTANT_AI_RATE`, and `NFSU2_DISTANT_AI_DIST` (all opt-in / off by default).
+
 ### Full Docker Build & Fast Relink (Completed on Linux Mint 22.3)
 - **Cached Docker state:** Image `nfsu2-r36s-build:latest` and volume `nfsu2-r36s-work` (containing `pcrecomp`, lifted C, and `113` guest `.o` files) are preserved on the Linux host.
-- **Generated artifacts in `build/r36s/` (Phase 1 + Phase 2 + Phase 3):**
-  - `nfsu2-v10.aarch64` (`87,427,048` bytes, SHA-1 `3253114e1f2ef9e7f7ed359d98b0fdd96ef590a0`, `glibc compat OK: max imported version GLIBC_2.18`, `NFSU2_EXE_BUILT_FOR=v10:4788224`)
+- **Generated artifacts in `build/r36s/` (Phases 1–4):**
+  - `nfsu2-v10.aarch64` (`87,398,760` bytes, SHA-1 `23a3111491b48c9b9b70e54da55eadd0225a134a`, `glibc compat OK: max imported version GLIBC_2.18`, `NFSU2_EXE_BUILT_FOR=v10:4788224`)
   - `guest-objs-v10.tar.gz` (`34,228,930` bytes, key `9d5fc65cf7d2cb0c5481a2e2cb0820c622570837`)
   - `nfsu2-v10.aarch64.debug`, `build-v10.txt`, `lift_stats-v10.json`, `build.log`
 
@@ -98,6 +109,17 @@ Measured on physical R36H with `nfsu2.cfg` set to `NFSU2_GRAPHICS=performance`, 
 | **Game-thread CPU (normalized @ 600 draws)** | `31.68 ms/frame` (`596 draws`, `28.04 FPS`) | **`29.87 ms/frame`** (`637 draws`, `28.00 FPS`) | **`-1.81 ms/frame` (`-5.7%`)** |
 
 - Raw logs saved at `/home/svvv/.gemini/antigravity/brain/e5a1aded-5ecf-426d-a670-34d5ffae205e/scratch/log_phase3_verify3.txt`, `log_phase3_bench_native.txt`, and `log_phase3_bench_lifted.txt`.
+
+### Phase 4 (Group 2) Physical R36H Verification & Benchmarks
+1. **Backlog #13 & #15 (`NFSU2_HALF_REFLECT=2`, `g_CarEnvironmentMapEnable=1;g_CarEnvironmentMapUpdateData=1`, `NFSU2_CROWD=0`, `NFSU2_PARTICLES=0`):**
+   - Verified `2,250 updated / 2,250 skipped` cubemap frames with zero flicker or visual artifacts.
+   - **A/B Comparison (`draws >= 450` steady driving windows):**
+     - Full-rate baseline (`=0`, 23 windows, `608 draws`, `1225 MHz`): `gameCPU = 34.68 ms/f` (`32.78 ms/f` @ 1296 MHz), `renderCPU = 28.46 ms/f` (`26.90 ms/f` @ 1296 MHz), `26.48 FPS`.
+     - Half-rate (`=2`, 38 windows, `636 draws`, `1205 MHz`): **`gameCPU = 32.23 ms/f`** (**`29.97 ms/f`** @ 1296 MHz, **`-2.81 ms/f` / `-8.6%`**), **`renderCPU = 27.01 ms/f`** (**`25.11 ms/f`** @ 1296 MHz, **`-1.79 ms/f` / `-6.7%`**), **`27.55 FPS`** (`+1.07 FPS` despite +28 more draws/frame).
+2. **Backlog #14 (`NFSU2_DISTANT_AI_RATE=2`, `NFSU2_DISTANT_AI_DIST=45`, `performance` preset):**
+   - Verified live on R36H (`2,250/4,500` distant traffic/AI controller ticks skipped per 300 frames; `154/154` distant AI racer `PhysicsMover` substep updates scaled `8 -> 4` when >45m away; human player unaffected; zero crashes or glitches).
+   - Steady driving (23 windows, `587 draws`, `1279 MHz`): **`gameCPU = 29.05 ms/f`**, **`renderCPU = 24.08 ms/f`**, **`28.76 FPS`** (vs Phase 3 baseline `31.69 ms/f` / `28.00 FPS` @ `637 draws`).
+- Raw logs & Cortex-A35 1 kHz hardware profile (`prof_samples.txt`, 2,705 game-thread samples: 11.3% Physics, 6.3% AI/Traffic) saved under `/home/svvv/.gemini/antigravity/brain/e5a1aded-5ecf-426d-a670-34d5ffae205e/scratch/`.
 - `/roms/ports/nfsu2/nfsu2.cfg` on R36H has been restored to clean default configuration.
 
 ---
@@ -116,20 +138,15 @@ Measured on physical R36H with `nfsu2.cfg` set to `NFSU2_GRAPHICS=performance`, 
 
 ---
 
-## 4. Remaining Optimization Roadmap (Target Scope: Group 2)
+## 4. Roadmap Status & Optional Follow-Ups
 
-Group 1 (Phase 3 — Backlog #2 & #4) is **complete and verified** on R36H (`1,899,576` calls / `0 bad`). User-approved remaining optimization scope now moves to **Group 2** (high-gain configurable trade-off toggles). Low-ROI / full-guest-recompile items (Group 3: Backlog #17 ThinLTO, #9 compiler flags, #6/#7 minor icall/x87 tweaks, #12 sound mixer) are skipped.
+**All user-approved optimization phases (Phases 1–4: Group 1 & Group 2) are now complete and verified on physical R36H:**
+- **Phase 1 (Backlog #11):** VAO Cache & Zero-Copy Uniforms — Complete (`-31.8%` GL state calls to driver).
+- **Phase 2 (Backlog #16 & #3):** Native `sub_005D62C0` & Direct Frustum Culling — Complete (`2,457,212/0 bad`).
+- **Phase 3 / Group 1 (Backlog #2 & #4):** Native Material/Item Setup, Hot D3DX Setters & `CommitChanges` — Complete (`1,899,576/0 bad`, `-1.57 ms/f` setup+commit, `-1.81 ms/f` normalized game CPU).
+- **Phase 4 / Group 2 (Backlog #13, #15, #14):** `NFSU2_HALF_REFLECT`, `NFSU2_CROWD`, `NFSU2_PARTICLES`, `NFSU2_DISTANT_AI_RATE`/`NFSU2_DISTANT_AI_DIST` — Complete and verified on R36H (`-8.6%` game CPU / `-6.7%` render CPU with `NFSU2_HALF_REFLECT=2`; clean distant AI/physics throttling with `NFSU2_DISTANT_AI_RATE=2`).
 
----
-
-### Group 2 (Phase 4) — High-Gain Configurable Trade-off Toggles (Backlog #13, #15, #14)
-
-Implement as configurable environment variables / `nfsu2.cfg` options so users can enable them for locked 30 FPS in heavy city/race scenes:
-
-1. **Backlog #13 — Half-Rate Car Reflection Map Update (`5–10%` Game + Render Thread Saving, Complexity `3/10`):**
-   - **Mechanism:** Update the car environment reflection render target (`view` / reflection pass) every other frame (`30 Hz → 15 Hz`, controlled via `NFSU2_HALF_REFLECT=1`, `0` off) while reusing the previous frame's reflection texture on skipped frames.
-   - **Why Highest Priority in Group 2:** Cuts both the game-thread scene walk/submission and the render-thread draw calls for the reflection pass in half, with negligible visual difference on the 3.5" 640×480 screen.
-2. **Backlog #15 — Fewer Particles / Crowd Toggle (`2–5%` Game + Render Thread Saving, Complexity `2/10`):**
-   - **Mechanism:** Expose clean runtime/config toggles for crowd disable (`g_CrowdEnable=0`) and particle density throttling (`NFSU2_PARTICLE_SKIP` or cap).
-3. **Backlog #14 — Lower Physics / AI Update Rate for Distant Cars (`5–10%` Game Thread Saving, Complexity `5/10`):**
-   - **Mechanism:** Identify distant AI/traffic car simulation steps beyond a distance threshold and throttle non-visible/distant update frequency (`NFSU2_DISTANT_AI_RATE`), preserving full physics rate for the player and nearby opponents.
+Optional next steps (outside core roadmap):
+1. **Downstream R36H Playable Pack:** Copy `build/r36s/nfsu2-v10.aarch64` to `ports/nfsu2/nfsu2.aarch64.v10`, apply the 4 downstream patchers (`patch_subtitles.py`, `patch_video.py`, `patch_gps.py`, `patch_attract.py`), and rebuild `dist/` packages.
+2. **Upstream PR:** Push branch `perf/gl-vao-uniforms` and open PR (optionally relinking `v12` as well).
+3. *(Skipped per scope)* Group 3 low-ROI / full-guest-rebuild items (Backlog #17 ThinLTO, #9 compiler flags, #6/#7 minor icall/x87, #12 NEON sound mixer).

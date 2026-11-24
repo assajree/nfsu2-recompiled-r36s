@@ -657,6 +657,7 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
         if(method==23)return createTextureAsync(deviceNative,args,count,result);
         if(method!=17)return queueDeviceCall(method,args,count,deviceNative);
         // Present
+        if(nfs_reflect_on_present)nfs_reflect_on_present();
         Cmd c{};c.op=OpDevice;c.method=17;c.obj=deviceNative;
         for(int i=0;i<9;++i)c.a[i]=args[i];
         {if(args[4])return false;*count=5;
