@@ -30,6 +30,8 @@ extern uint32_t getD3D9PresentCount(void);
  */
 extern void sub_006644A6(void); extern void sub_0066A9F6(void); extern void sub_0066A93B(void);
 extern void sub_0065AAEC(void); extern void sub_0065AA06(void);
+extern int nfs_fx_setup_mode(void);
+extern int nfs_fx_commit_changes(uint32_t fx);
 __attribute__((weak)) void nfsPassWatch(int mode) { (void)mode; }   /* d3d9_render_thread.inc */
 __attribute__((weak)) int nfsPassConflict(void) { return 1; }
 extern uint64_t nfsD3dPushedCount(void);
@@ -53,7 +55,9 @@ void nfs_fx_lazy_begin_pass(void) {
         const int conflict = nfsPassConflict();
         nfsPassWatch(0);
         if (!conflict) {
-            push32h(fx); push32h(RECOMP_RETADDR); sub_0066A93B();          /* CommitChanges */
+            if (nfs_fx_setup_mode() != 1 || !nfs_fx_commit_changes(fx)) {
+                push32h(fx); push32h(RECOMP_RETADDR); sub_0066A93B();          /* CommitChanges */
+            }
             if (lazyMode == 2) {
                 realEndPass(fx);
                 const uint64_t p0 = nfsD3dPushedCount();
@@ -84,7 +88,15 @@ void nfs_fx_lazy_end_pass(void) {
 }
 void nfs_fx_lazy_commit(void) {
     /* inside the deferred pass: the effect's own device calls are not conflicts */
-    if (pPending) { nfsPassWatch(0); sub_0066A93B(); nfsPassWatch(3); return; }
+    const uint32_t fx = *(const uint32_t*)ADDR(g_esp + 4);
+    if (pPending) {
+        nfsPassWatch(0);
+        if (nfs_fx_setup_mode() == 1 && nfs_fx_commit_changes(fx)) { g_eax = 0; g_esp += 8; nfsPassWatch(3); return; }
+        sub_0066A93B();
+        nfsPassWatch(3);
+        return;
+    }
+    if (nfs_fx_setup_mode() == 1 && nfs_fx_commit_changes(fx)) { g_eax = 0; g_esp += 8; return; }
     sub_0066A93B();
 }
 void nfs_fx_lazy_begin(void) { if (pPending || pOpen) flushPending(); sub_006644A6(); }

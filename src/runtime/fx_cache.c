@@ -427,4 +427,377 @@ void sub_00668EC5(void) {
     }
     g_eax = result; g_esp += 12;  /* ret 8 */
 }
+
+/*
+ * ---- Native D3DX effect engine, part 3: parameter setters, dirty marking & CommitChanges ----
+ *
+ * Ports sub_00660280 + sub_0065A835 (dirty propagation), the hot pointer-handle paths of
+ * SetMatrix (0066CE4E), SetVector (0066D017), SetVectorArray (0066C74C), SetFloat (0066F215),
+ * SetIntArray (0066E5BD), SetTexture unchanged no-op (0066D4FD), and CommitChanges (0066A93B +
+ * sub_00669F83 + sub_006620FE) directly to C. Any rare case (name handles, stateblock recording
+ * mode == 3, dirty-list grow, non-float constant conversions, or [fx+0x118] & 1) returns 0 so the
+ * caller falls back to the lifted D3DX function unchanged.
+ *   NFSU2_NATIVE_SETUP=0  lifted
+ *                      1  native (default)
+ *                      2  verify (checked against lifted originals in world_cull.c)
+ */
+int nfs_fx_setup_mode(void) {
+    static int mode = -1;
+    if (__builtin_expect(mode < 0, 0)) { const char* e = getenv("NFSU2_NATIVE_SETUP"); mode = e ? atoi(e) : 1; }
+    return mode;
+}
+
+static int canMarkOne(uint32_t fx, uint32_t param) {
+    if (!validGuest(fx) || !validGuest(param)) return 0;
+    if (!(M8(fx + 0x119) & 1)) return 1;
+    const uint32_t pIdx = M32(param + 0x14);
+    uint32_t need = 0;
+    if (M32(fx + 0xB4)) {
+        if (pIdx >= M32(fx + 0xAC)) return 1;
+        uint32_t list = M32(M32(fx + 0xB8) + pIdx * 4);
+        if (!list) return 1;
+        for (int guard = 0; guard < 256; ++guard, list += 4) {
+            const uint32_t b = M32(list);
+            if (!b) return M32(fx + 0x10C) + need <= M32(fx + 0x110);
+            if (!(M8(M32(b + 8) + 0x30) & 2)) ++need;
+        }
+        return 0;
+    } else {
+        const uint32_t pInfo = M32(M32(fx + 0xB0) + pIdx * 4);
+        const uint32_t head = M32(pInfo + 0x34);
+        if (!head) return 1;
+        const uint32_t passes = M32(fx + 0x2C);
+        uint32_t b = M32(head + 0x18);
+        for (int guard = 0; guard < 256; ++guard) {
+            b = M32(b + 0x1C);
+            const uint32_t passPtr = passes + (uint32_t)M16(b + 0x14) * 0x64u;
+            const uint32_t st = M32(passPtr + 4) + (uint32_t)M16(b + 0x16) * 0x64u;
+            if (!(M8(st + 0x30) & 2)) ++need;
+            if (M32(b + 0x1C) == head) return M32(fx + 0x10C) + need <= M32(fx + 0x110);
+        }
+        return 0;
+    }
+}
+
+static int canMarkDirty(uint32_t fx, uint32_t param) {
+    if (!validGuest(fx) || !validGuest(param)) return 0;
+    const uint32_t pInfo = M32(M32(fx + 0xB0) + M32(param + 0x14) * 4);
+    const uint32_t pool = M32(pInfo + 0x40);
+    if (!pool) return canMarkOne(fx, param);
+    const uint32_t state = M32(fx + 0x38);
+    const uint32_t cnt = M32(state + 8);
+    if (cnt == 0) return 1;
+    if (cnt == 1) {
+        const uint32_t owner = M32(state + 0xC);
+        if (owner == fx) return canMarkOne(fx, param);
+        if (owner) {
+            uint32_t s = M32(pool + 0x10);
+            for (int guard = 0; guard < 64 && s != pool; ++guard, s = M32(s + 0x10)) {
+                if (M32(s) == owner) return canMarkOne(owner, M32(s + 4));
+            }
+            if (s != pool) return 0;
+        }
+    }
+    uint32_t s = M32(pool + 0x10);
+    for (int guard = 0; guard < 64 && s != pool; ++guard, s = M32(s + 0x10)) {
+        const uint32_t ef = M32(s);
+        if (ef && (M8(ef + 0x119) & 1) && !canMarkOne(ef, M32(s + 4))) return 0;
+    }
+    if (s != pool) return 0;
+    if ((M8(fx + 0x119) & 1) && !canMarkOne(fx, param)) return 0;
+    return 1;
+}
+
+static void markOneEffect(uint32_t fx, uint32_t param) {
+    const uint32_t pIdx = M32(param + 0x14);
+    if (M32(fx + 0xB4)) {
+        if (pIdx >= M32(fx + 0xAC)) return;
+        M8(M32(fx + 0xBC) + pIdx) = 1;
+        uint32_t list = M32(M32(fx + 0xB8) + pIdx * 4);
+        if (!list) return;
+        if (!(M8(fx + 0x119) & 1)) {
+            uint32_t b;
+            while ((b = M32(list)) != 0) {
+                M32(b) = 1;
+                M32(M32(b + 8)) = 1;
+                list += 4;
+            }
+        } else {
+            uint32_t b;
+            while ((b = M32(list)) != 0) {
+                const uint32_t st = M32(b + 8);
+                M32(b) = 1;
+                M32(st) = 1;
+                if (!(M8(st + 0x30) & 2)) {
+                    const uint32_t idx = M32(fx + 0x10C);
+                    const uint32_t dl = M32(fx + 0x108);
+                    M16(dl + idx * 4) = M16(b + 0x14);
+                    M16(dl + idx * 4 + 2) = M16(b + 0x16);
+                    M32(st + 0x30) |= 2u;
+                    M32(fx + 0x10C) = idx + 1;
+                }
+                list += 4;
+            }
+        }
+    } else {
+        const uint32_t pInfo = M32(M32(fx + 0xB0) + pIdx * 4);
+        const uint32_t head = M32(pInfo + 0x34);
+        if (!head) return;
+        const uint32_t passes = M32(fx + 0x2C);
+        uint32_t b = M32(head + 0x18);
+        if (!(M8(fx + 0x119) & 1)) {
+            do {
+                b = M32(b + 0x1C);
+                M32(b) = 1;
+                const uint32_t st = M32(passes + (uint32_t)M16(b + 0x14) * 0x64u + 4) + (uint32_t)M16(b + 0x16) * 0x64u;
+                M32(st) = 1;
+            } while (M32(b + 0x1C) != head);
+        } else {
+            do {
+                b = M32(b + 0x1C);
+                M32(b) = 1;
+                const uint32_t st = M32(passes + (uint32_t)M16(b + 0x14) * 0x64u + 4) + (uint32_t)M16(b + 0x16) * 0x64u;
+                M32(st) = 1;
+                if (!(M8(st + 0x30) & 2)) {
+                    const uint32_t idx = M32(fx + 0x10C);
+                    const uint32_t dl = M32(fx + 0x108);
+                    M16(dl + idx * 4) = M16(b + 0x14);
+                    M16(dl + idx * 4 + 2) = M16(b + 0x16);
+                    M32(st + 0x30) |= 2u;
+                    M32(fx + 0x10C) = idx + 1;
+                }
+            } while (M32(b + 0x1C) != head);
+        }
+    }
+}
+
+static void markDirty(uint32_t fx, uint32_t param) {
+    const uint32_t pInfo = M32(M32(fx + 0xB0) + M32(param + 0x14) * 4);
+    const uint32_t pool = M32(pInfo + 0x40);
+    if (!pool) { markOneEffect(fx, param); return; }
+    const uint32_t state = M32(fx + 0x38);
+    const uint32_t cnt = M32(state + 8);
+    if (cnt == 0) return;
+    if (cnt == 1) {
+        const uint32_t owner = M32(state + 0xC);
+        if (owner == fx) { markOneEffect(fx, param); return; }
+        if (owner) {
+            for (uint32_t s = M32(pool + 0x10); s != pool; s = M32(s + 0x10)) {
+                if (M32(s) == owner) { markOneEffect(owner, M32(s + 4)); return; }
+            }
+        }
+    }
+    for (uint32_t s = M32(pool + 0x10); s != pool; s = M32(s + 0x10)) {
+        const uint32_t ef = M32(s);
+        if (ef && (M8(ef + 0x119) & 1)) markOneEffect(ef, M32(s + 4));
+    }
+    if (M8(fx + 0x119) & 1) markOneEffect(fx, param);
+}
+
+int nfs_fx_set_matrix(uint32_t fx, uint32_t handle, const float* mat) {
+    if ((int32_t)handle >= 0 || !mat || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    if (M32(desc + 4) != 2 || (M32(desc + 0x10) != 0 && M32(param + 8) == 0xFFFFFFFFu) || M32(desc) != 3) return 0;
+    if (!canMarkDirty(fx, param)) return 0;
+    uint32_t* dst = (uint32_t*)ADDR(M32(param));
+    const uint32_t* src = (const uint32_t*)mat;
+    for (int c = 0; c < 4; ++c) {
+        dst[c * 4 + 0] = src[0 * 4 + c];
+        dst[c * 4 + 1] = src[1 * 4 + c];
+        dst[c * 4 + 2] = src[2 * 4 + c];
+        dst[c * 4 + 3] = src[3 * 4 + c];
+    }
+    nfs_fx_param_set(handle);
+    markDirty(fx, param);
+    return 1;
+}
+
+int nfs_fx_set_vector(uint32_t fx, uint32_t handle, const float* vec) {
+    if ((int32_t)handle >= 0 || !vec || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    const uint32_t cls = M32(desc + 4), cols = M32(desc + 0x14);
+    if ((M32(desc + 0x10) != 0 && M32(param + 8) == 0xFFFFFFFFu) || cls > 1 || M32(desc) != 3 || cols > 4) return 0;
+    if (!canMarkDirty(fx, param)) return 0;
+    memcpy((void*)ADDR(M32(param)), vec, cols * 4u);
+    nfs_fx_param_set(handle);
+    markDirty(fx, param);
+    return 1;
+}
+
+int nfs_fx_set_vector_array(uint32_t fx, uint32_t handle, const float* vecs, uint32_t count) {
+    if ((int32_t)handle >= 0 || !vecs || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    const uint32_t elems = M32(desc + 0x10);
+    if (!elems || M32(param + 8) != 0xFFFFFFFFu || count > elems || M32(desc + 4) != 1 || M32(desc) != 3 || M32(desc + 0x14) != 4) return 0;
+    if (!canMarkDirty(fx, param)) return 0;
+    if (count) memcpy((void*)ADDR(M32(param)), vecs, (size_t)count * 16u);
+    nfs_fx_param_set(handle);
+    markDirty(fx, param);
+    return 1;
+}
+
+int nfs_fx_set_float(uint32_t fx, uint32_t handle, float val) {
+    if ((int32_t)handle >= 0 || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    if ((M32(desc + 0x10) != 0 && M32(param + 8) == 0xFFFFFFFFu) || M32(desc + 4) > 3 || M32(desc + 0x14) != 1 || M32(desc + 0x18) != 1 || M32(desc) != 3) return 0;
+    const uint32_t dst = M32(param);
+    if (*(const float*)ADDR(dst) == val) return 1;  /* exact match to fucompp; jnp in sub_0066F215 */
+    if (!canMarkDirty(fx, param)) return 0;
+    *(float*)ADDR(dst) = val;
+    nfs_fx_param_set(handle);
+    markDirty(fx, param);
+    return 1;
+}
+
+int nfs_fx_set_int_array(uint32_t fx, uint32_t handle, const uint32_t* vals, uint32_t count) {
+    if ((int32_t)handle >= 0 || !vals || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    const uint32_t cls = M32(desc + 4);
+    if ((cls != 0 && cls != 1 && cls != 3) || M32(desc) != 2) return 0;
+    const uint32_t cols = M32(desc + 0x14);
+    if (cols > 4) return 0;
+    if (!canMarkDirty(fx, param)) return 0;
+    const uint32_t nElem = (M32(desc + 0x10) != 0 && M32(param + 8) == 0xFFFFFFFFu) ? M32(desc + 0x10) : 1u;
+    uint32_t dst = M32(param), rem = count, idx = 0;
+    for (uint32_t e = 0; e < nElem && rem > 0; ++e) {
+        for (uint32_t c = 0; c < cols && rem > 0; ++c, --rem) {
+            M32(dst) = vals[idx++];
+            dst += 4;
+        }
+        dst += (4u - cols) * 4u;
+    }
+    nfs_fx_param_set(handle);
+    markDirty(fx, param);
+    return 1;
+}
+
+int nfs_fx_set_texture_noop(uint32_t fx, uint32_t handle, uint32_t tex) {
+    if ((int32_t)handle >= 0 || !validGuest(fx) || M32(fx + 0x3C) == 3) return 0;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return 0;
+    const uint32_t desc = M32(param + 4);
+    if ((M32(desc + 0x10) != 0 && M32(param + 8) == 0xFFFFFFFFu) || M32(desc) < 5 || M32(desc) > 9) return 0;
+    const uint32_t pInfo = M32(M32(fx + 0xB0) + M32(param + 0x14) * 4);
+    const uint32_t pool = M32(pInfo + 0x40);
+    const uint32_t i0 = M32(M32(param));
+    const uint32_t ti = pool ? M32(M32(pool + 8) + i0 * 4) : i0;
+    return M32(M32(fx + 0x18) + ti * 24u + 4) == tex;
+}
+
+static uint32_t gatherFloatConst(uint32_t fx, uint32_t st, uint32_t dst) {
+    const uint32_t src = M32(st + 8);
+    const uint32_t desc = M32(st + 0xC);
+    const uint32_t ctabBase = M32(st + 0x3C);
+    const uint32_t ctabOff = M32(M32(st + 0x34) + 0x10);
+    const uint32_t cls = ctabBase ? (uint32_t)M16(ctabBase + M32(ctabOff + 0xC)) : M32(desc + 4);
+    const uint32_t pInfo = M32(M32(fx + 0xB0) + M32(st + 0x1C) * 4);
+    const uint32_t elemCount = M32(pInfo + 0x4C);
+    const uint32_t nElem = elemCount != 0xFFFFFFFFu ? elemCount : (M32(desc + 0x10) ? M32(desc + 0x10) : 1u);
+    uint32_t regRem = M16(st + 0x56);
+    uint32_t d = dst;
+    if (cls == 2) {
+        const uint32_t cols = M32(desc + 0x14), rows = M32(desc + 0x18);
+        uint32_t s0 = src;
+        for (uint32_t e = 0; e < nElem && regRem > 0; ++e, s0 += 0x40u) {
+            for (uint32_t c = 0; c < cols && regRem > 0; ++c, d += 0x10u, --regRem) {
+                for (uint32_t r = 0; r < rows; ++r) M32(d + r * 4u) = M32(s0 + c * 4u + r * 0x10u);
+            }
+        }
+    } else {
+        const uint32_t rows = M32(desc + 0x18);
+        const uint32_t pad = cls == 3 ? ((4u - rows) << 4) : 0u;
+        uint32_t s = src;
+        for (uint32_t e = 0; e < nElem && regRem > 0; ++e, s += pad) {
+            for (uint32_t r = 0; r < rows && regRem > 0; ++r, d += 0x10u, s += 0x10u, --regRem) {
+                memcpy((void*)ADDR(d), (const void*)ADDR(s), 16);
+            }
+        }
+    }
+    return (d - dst) >> 4;
+}
+
+static inline void restoreControlFpPC(uint32_t savedVal) {
+    /* exact match to CRT _controlfp(savedVal, 0x30000) (sub_0075D88A -> sub_0075D858) */
+    const uint32_t pc = savedVal & 0x00030000u;
+    const uint16_t pcBits = pc == 0u ? 0x0300u : (pc == 0x00010000u ? 0x0200u : 0u);
+    g_fpu_cw = (uint16_t)((g_fpu_cw & 0x1C3Fu) | pcBits);
+}
+
+int nfs_fx_commit_changes(uint32_t fx) {
+    if (nfs_fx_cap_depth || !validGuest(fx)) return 0;
+    const uint32_t n = M32(fx + 0x10C);
+    if (n == 0) {
+        if (M8(fx + 0x118) & 1) { restoreControlFpPC(M32(fx + 0x114)); M32(fx + 0x118) &= ~1u; }
+        M32(fx + 0x118) &= ~4u;
+        return 1;
+    }
+    const uint32_t dl = M32(fx + 0x108), passes = M32(fx + 0x2C);
+    if (!validGuest(dl) || !validGuest(passes)) return 0;
+    /* pre-scan: verify every shader-constant dirty entry is supported natively before mutating state */
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t passPtr = passes + (uint32_t)M16(dl + i * 4) * 0x64u;
+        const uint32_t st = M32(passPtr + 4) + (uint32_t)M16(dl + i * 4 + 2) * 0x64u;
+        if (M16(passPtr + 0x3C) > 0 && M32(st) != 0 && (M8(st + 0x30) & 8)) {
+            const uint32_t code = M32(st + 0x58), type = code >> 24;
+            if (type == 0x0F) continue;
+            if (code != 0x0C000000u && code != 0x0D000000u) return 0;
+            if (!(M8(st + 0x30) & 0x10)) {
+                const uint32_t desc = M32(st + 0xC), ctabBase = M32(st + 0x3C);
+                const uint32_t ctabOff = M32(M32(st + 0x34) + 0x10);
+                const uint32_t cls = ctabBase ? (uint32_t)M16(ctabBase + M32(ctabOff + 0xC)) : M32(desc + 4);
+                if (cls > 3 || M32(desc) != 3) return 0;
+            }
+        }
+    }
+    const uint32_t dev = M32(fx + 8);
+    M32(fx + 0x118) |= 4u;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t passIdx = M16(dl + i * 4), stateIdx = M16(dl + i * 4 + 2);
+        const uint32_t passPtr = passes + passIdx * 0x64u;
+        const uint32_t st = M32(passPtr + 4) + stateIdx * 0x64u;
+        M32(st + 0x30) &= ~2u;
+        if (M16(passPtr + 0x3C) > 0 && M32(st) != 0) {
+            if (M8(st + 0x30) & 8) {
+                const uint32_t code = M32(st + 0x58), type = code >> 24;
+                M32(st) = M32(st + 4);
+                if (type == 0x0F) {
+                    native6689E4(fx, passPtr, st, st + 0x64u, 0, 0, 0);
+                } else {
+                    const uint32_t dst = M32(st + 0x48) + M32(passPtr);
+                    uint32_t cnt;
+                    if (M8(st + 0x30) & 0x10) {
+                        const uint32_t bytes = M32(st + 0x60);
+                        if (bytes) memmove((void*)ADDR(dst), (const void*)ADDR(M32(st + 0x5C)), bytes);
+                        cnt = M16(st + 0x56);
+                    } else {
+                        cnt = gatherFloatConst(fx, st, dst);
+                    }
+                    const int isVS = type == 0x0C;
+                    const uint32_t a[4] = {dev, M16(st + 0x54), dst, isVS ? cnt : (uint32_t)M16(st + 0x56)};
+                    devCall(isVS ? 94 : 109, 4, a);
+                }
+            } else {
+                if (fxStateMode() != 2 || !fastApply(passPtr, stateIdx, 0xFFFFu))
+                    guestApply(fx, passIdx, stateIdx, 0xFFFFu);
+            }
+        }
+    }
+    if (M8(fx + 0x118) & 1) {
+        restoreControlFpPC(M32(fx + 0x114));
+        M32(fx + 0x118) &= ~1u;
+    }
+    M32(fx + 0x10C) = 0;
+    M32(fx + 0x118) &= ~4u;
+    return 1;
+}
 #endif /* !NFS_FX_PRESHADER_ONLY */
