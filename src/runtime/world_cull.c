@@ -55,7 +55,10 @@ static const Bound* solidBound(uint32_t solid) {
 }
 
 static uint32_t slotItems[23], slotGroups[23], stDiff[10], stDiffIdent;
-static float drawDist = -1;
+static float drawDist = -1, effDist = -1;
+static int drawBudget = -1;
+static uint32_t frameKept = 0, lastBudgetFrame = 0xffffffffu;
+float nfs_effective_draw_dist(void) { return effDist > 0.0f ? effDist : (drawDist > 0.0f ? drawDist : 0.0f); }
 static uint32_t stFrame, stFrames, stItems, stCulled, stNoBound, stHist[8];
 
 /*
@@ -1728,7 +1731,32 @@ static void nativeFlush(void) {
 }
 static int g_nativeFlush = -1;
 void sub_005CF150(void) {
-    if (drawDist < 0) { const char* e = getenv("NFSU2_DRAW_DIST"); drawDist = e ? (float)atof(e) : 0; }
+    if (drawDist < 0) {
+        const char* e = getenv("NFSU2_DRAW_DIST");
+        drawDist = e ? (float)atof(e) : 0.0f;
+        const char* eb = getenv("NFSU2_DRAW_BUDGET");
+        drawBudget = eb ? atoi(eb) : 0;
+        if (drawBudget < 0) drawBudget = 0;
+        effDist = drawDist > 0.0f ? drawDist : (drawBudget > 0 ? 200.0f : 0.0f);
+    }
+    const uint32_t curFrame = getD3D9PresentCount();
+    if (curFrame != lastBudgetFrame) {
+        if (lastBudgetFrame != 0xffffffffu && drawBudget > 0 && effDist > 0.0f) {
+            const float maxDist = drawDist > 0.0f ? drawDist : 200.0f;
+            const float minDist = 45.0f < maxDist ? 45.0f : maxDist;
+            const uint32_t hi = (uint32_t)((float)drawBudget * 1.10f);
+            const uint32_t lo = (uint32_t)((float)drawBudget * 0.90f);
+            if (frameKept > hi) {
+                effDist *= 0.94f;
+                if (effDist < minDist) effDist = minDist;
+            } else if (frameKept < lo) {
+                effDist *= 1.03f;
+                if (effDist > maxDist) effDist = maxDist;
+            }
+        }
+        frameKept = 0;
+        lastBudgetFrame = curFrame;
+    }
     const uint32_t viewRec = M32(0x870848);
     const uint32_t viewId = validGuest(viewRec) ? M32(viewRec + 4) : 0xffffffffu;
     const uint32_t vm = viewId < 64 ? M32(0x832DE0 + viewId * 0x70) : 0;
@@ -1768,9 +1796,9 @@ void sub_005CF150(void) {
                     ++stItems;
                     const uint32_t mesh = M32(it + 0x10), mat = M32(it + 0x24);
                     const uint32_t solid = validGuest(mesh) ? M32(mesh) : 0;
-                    if (!validGuest(solid) || !validGuest(mat)) { ++stNoBound; continue; }
+                    if (!validGuest(solid) || !validGuest(mat)) { ++stNoBound; ++frameKept; continue; }
                     const Bound* b = solidBound(solid);
-                    if (!b->ok) { ++stNoBound; continue; }
+                    if (!b->ok) { ++stNoBound; ++frameKept; continue; }
                     const float* W = (const float*)ADDR(mat);
                     float c[3], sc = 0;
                     for (int j = 0; j < 3; ++j) c[j] = b->c[0] * W[0 * 4 + j] + b->c[1] * W[1 * 4 + j] + b->c[2] * W[2 * 4 + j] + W[12 + j];
@@ -1781,12 +1809,14 @@ void sub_005CF150(void) {
                     ++stHist[bin];
                     if (bin == 7) { static int shown; if (shown++ < 12) printf("[NFSU2 CULL] far item: slot %u near %.0f centre %.0f radius %.0f scale %.2f identity %d solid %08x verts %u fx %08x view %u\n",
                         s, near, sqrtf(dx * dx + dy * dy + dz * dz), b->r, sqrtf(sc), mat == 0x872E90u, solid, M32(solid + 0x34), M32(M32(it + 0x18) + 0x20), viewId); }
-                    if (drawDist > 0 && near > drawDist && validGuest(itemPool)) {
+                    if (effDist > 0 && near > effDist && validGuest(itemPool)) {
                         /* unlink and give back to the item pool (sub_0043F970) */
                         const uint32_t prev = M32(it + 4);
                         M32(prev) = next; M32(next + 4) = prev;
                         M32(it) = M32(itemPool + 0x10); M32(itemPool + 0x10) = it; M32(itemPool + 0x18) -= 1;
                         ++stCulled;
+                    } else {
+                        ++frameKept;
                     }
                 }
             }
@@ -1796,8 +1826,8 @@ void sub_005CF150(void) {
     if (now != stFrame) {
         stFrame = now;
         if (++stFrames % 240 == 0 && stItems) {
-            printf("[NFSU2 CULL] items/frame %u (no bound %u), nearest surface distance: <100m %u, <150 %u, <200 %u, <250 %u, <300 %u, <400 %u, <600 %u, more %u; culled %u (draw distance %.0f m)\n",
-                   stItems / 240, stNoBound / 240, stHist[0] / 240, stHist[1] / 240, stHist[2] / 240, stHist[3] / 240, stHist[4] / 240, stHist[5] / 240, stHist[6] / 240, stHist[7] / 240, stCulled / 240, drawDist);
+            printf("[NFSU2 CULL] items/frame %u (no bound %u), nearest surface distance: <100m %u, <150 %u, <200 %u, <250 %u, <300 %u, <400 %u, <600 %u, more %u; culled %u (draw distance %.0f m, eff %.0f m, budget %d)\n",
+                   stItems / 240, stNoBound / 240, stHist[0] / 240, stHist[1] / 240, stHist[2] / 240, stHist[3] / 240, stHist[4] / 240, stHist[5] / 240, stHist[6] / 240, stHist[7] / 240, stCulled / 240, drawDist, effDist, drawBudget);
             printf("[NFSU2 CULL] per slot items/groups:");
             for (int k = 0; k < 23; ++k) if (slotItems[k]) printf(" s%d=%u/%u", k, slotItems[k] / 240, slotGroups[k] / 240);
             printf("\n");

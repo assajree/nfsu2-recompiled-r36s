@@ -46,6 +46,7 @@ thread_local bool g_glesDeferTextureGL = false;
 // Panel rotation in degrees (0, 90, 270), set by the host before the device exists (main.cpp, NFSU2_ROTATE).
 uint32_t g_nfsScreenRotation = 0;
 extern "C" void nfs_widescreen_set_resolution(unsigned width, unsigned height);
+extern "C" float nfs_effective_draw_dist(void) __attribute__((weak));
 
 namespace {
 std::mutex g_windowMutex;
@@ -1360,6 +1361,10 @@ IDirect3DDevice9GLES::IDirect3DDevice9GLES(IDirect3D9GLES* parentD3D, SDL_Window
     caps.elementIndexUint = hasGLExtension("GL_OES_element_index_uint");
     caps.blendMinMax = hasGLExtension("GL_EXT_blend_minmax");
     caps.halfFloatVertex = hasGLExtension("GL_OES_vertex_half_float");
+    {
+        const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        caps.es3 = ver && std::strstr(ver, "OpenGL ES 3.") != nullptr;
+    }
     glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &m_maxAttribs);
     if (m_maxAttribs > 16) m_maxAttribs = 16;
     std::printf("[D3D9 GLES] caps: npot=%d d24s8=%d uint=%d minmax=%d half=%d attribs=%d\n", caps.npot,
@@ -3069,7 +3074,7 @@ static GLint glWrap(DWORD a) {
     }
 }
 
-void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* tex) {
+void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* tex, bool is2DUI) {
     GLTextureObject* obj = nullptr;
     if (tex->GetType() == D3DRTYPE_TEXTURE) obj = static_cast<IDirect3DTexture9GLES*>(tex)->glObject();
     else if (tex->GetType() == D3DRTYPE_CUBETEXTURE) obj = static_cast<IDirect3DCubeTexture9GLES*>(tex)->glObject();
@@ -3086,16 +3091,41 @@ void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* 
     if (mipF == D3DTEXF_NONE) glMin = minPoint ? GL_NEAREST : GL_LINEAR;
     else if (mipF == D3DTEXF_POINT) glMin = minPoint ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_NEAREST;
     else glMin = minPoint ? GL_NEAREST_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_LINEAR;
-    const GLint glMag = (magF == D3DTEXF_POINT || magF == D3DTEXF_NONE) ? GL_NEAREST : GL_LINEAR;
+    GLint glMag = (magF == D3DTEXF_POINT || magF == D3DTEXF_NONE) ? GL_NEAREST : GL_LINEAR;
+    static const int potato = [] {
+        const char* e = std::getenv("NFSU2_POTATO");
+        int v = e ? std::atoi(e) : 0;
+        return v < 0 ? 0 : (v > 3 ? 3 : v);
+    }();
+    GLint targetBase = 0;
+    if (potato >= 2 && !is2DUI && obj->mipmapped() && !obj->renderTarget && obj->target == GL_TEXTURE_2D) {
+        const UINT maxDim = (potato == 2) ? 32u : 8u;
+        UINT d = std::max(obj->width, obj->height);
+        while (d > maxDim && static_cast<UINT>(targetBase + 1) < obj->d3dLevels) {
+            d >>= 1;
+            ++targetBase;
+        }
+        if (potato == 2) {
+            glMin = GL_NEAREST_MIPMAP_NEAREST;
+            glMag = GL_NEAREST;
+        } else {
+            glMin = GL_LINEAR_MIPMAP_LINEAR;
+            glMag = GL_LINEAR;
+        }
+    }
     SamplerParamCache& c = obj->cache;
     const GLenum t = obj->target;
     if (c.wrapS != wrapS) { glTexParameteri(t, GL_TEXTURE_WRAP_S, wrapS); c.wrapS = wrapS; }
     if (c.wrapT != wrapT) { glTexParameteri(t, GL_TEXTURE_WRAP_T, wrapT); c.wrapT = wrapT; }
     if (c.minF != glMin) { glTexParameteri(t, GL_TEXTURE_MIN_FILTER, glMin); c.minF = glMin; }
     if (c.magF != glMag) { glTexParameteri(t, GL_TEXTURE_MAG_FILTER, glMag); c.magF = glMag; }
+    if (glesCaps().es3 && c.baseLevel != targetBase) {
+        glTexParameteri(t, 0x813C /* GL_TEXTURE_BASE_LEVEL */, targetBase);
+        c.baseLevel = targetBase;
+    }
 }
 
-void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ffpPS, int ffpStages) {
+void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ffpPS, int ffpStages, bool is2DUI) {
     auto bindStage = [&](int stage, bool wantCube) {
         glActiveTexture(GL_TEXTURE0 + stage);
         IDirect3DBaseTexture9* tex = m_boundTextures[stage];
@@ -3106,7 +3136,7 @@ void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ff
         } else {
             glBindTexture(GL_TEXTURE_2D, is2D ? static_cast<IDirect3DTexture9GLES*>(tex)->getGLTexture() : m_dummy2D);
         }
-        if ((wantCube && isCube) || (!wantCube && is2D)) applySamplerParams(stage, tex);
+        if ((wantCube && isCube) || (!wantCube && is2D)) applySamplerParams(stage, tex, is2DUI);
     };
     if (psVariant) {
         for (const auto& s : psVariant->samplers) {
@@ -3287,7 +3317,8 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         std::memcpy(&f[4], &m_rs[D3DRS_FOGSTART], 4);
         std::memcpy(&f[5], &m_rs[D3DRS_FOGEND], 4);
         std::memcpy(&f[6], &m_rs[D3DRS_FOGDENSITY], 4);
-        static const float drawDist = [] { const char* e = std::getenv("NFSU2_DRAW_DIST"); return e ? static_cast<float>(std::atof(e)) : 0.0f; }();
+        static const float envDrawDist = [] { const char* e = std::getenv("NFSU2_DRAW_DIST"); return e ? static_cast<float>(std::atof(e)) : 0.0f; }();
+        const float drawDist = nfs_effective_draw_dist ? nfs_effective_draw_dist() : envDrawDist;
         f[7] = drawDist;
         if (drawDist > 0 && lp->fogRadLoc != -1) {
             const float vw = static_cast<float>(m_viewport.Width ? m_viewport.Width : 1), vh = static_cast<float>(m_viewport.Height ? m_viewport.Height : 1);
@@ -3498,7 +3529,8 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         }
     }
 
-    applyTextures(psVar, !m_boundPS, ffpStages);
+    const bool is2DUI = hasPositionT || (upData != nullptr) || !m_rs[D3DRS_ZENABLE];
+    applyTextures(psVar, !m_boundPS, ffpStages, is2DUI);
     applyRenderStates();
     applyViewportAndScissor();
     return true;

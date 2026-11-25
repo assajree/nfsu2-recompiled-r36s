@@ -55,6 +55,11 @@ static inline int mode(void) {
     if (g_mode < 0) { const char* e = getenv("NFSU2_NATIVE_SCENE"); g_mode = e ? atoi(e) : 1; }
     return g_mode;
 }
+static int g_potato = -1;
+static inline int potatoLevel(void) {
+    if (g_potato < 0) { const char* e = getenv("NFSU2_POTATO"); g_potato = e ? atoi(e) : 0; if (g_potato < 0) g_potato = 0; if (g_potato > 3) g_potato = 3; }
+    return g_potato;
+}
 /* NFSU2_SCENE_TIMING=1: time per call of sub_005C5600 and sub_005D6700 (callees included), lifted or native,
  * with the generic timer; printed every 600 frames ([NFSU2 SCENE] timing) */
 static int g_timing = -1;
@@ -386,6 +391,8 @@ static int sceneObject(uint32_t self, uint32_t objIdx, uint32_t view, uint32_t v
     const int32_t pix = pixelSize(view, obj + 0x20, rad);
     if (pix <= 1) return 1;
     const uint32_t vflags = M32(view + 0x44);
+    const int potato = potatoLevel();
+    if (potato >= 3 && (vflags & 0x1800u) && M32(0x00870CB8u) == 0u) return 1;
     uint32_t model = 0;
     if (vflags & 0x1800u) {
         if (pix < 0x20) return 1;
@@ -396,6 +403,11 @@ static int sceneObject(uint32_t self, uint32_t objIdx, uint32_t view, uint32_t v
     } else if ((int32_t)M32(0x8707DC) >= 3) {
         if (pix < 0x17) return 1;
         model = M32(info + 0x34);
+    } else if (potato > 0) {
+        static const int32_t minPix[4] = {0x11, 24, 30, 36};
+        if (pix < minPix[potato]) return 1;
+        model = M32(info + 0x38);
+        if (!model) model = M32(info + 0x34);
     } else {
         if (pix < 0x11) return 1;
         const uint32_t m0 = M32(info + 0x30);

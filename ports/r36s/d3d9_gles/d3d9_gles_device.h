@@ -270,8 +270,8 @@ private:
     void presentBackBuffer();
     void applyViewportAndScissor();
     void applyRenderStates();
-    void applyTextures(const struct ShaderVariant* psVariant, bool ffpPS, int ffpStages);
-    void applySamplerParams(int stage, IDirect3DBaseTexture9* tex);
+    void applyTextures(const struct ShaderVariant* psVariant, bool ffpPS, int ffpStages, bool is2DUI);
+    void applySamplerParams(int stage, IDirect3DBaseTexture9* tex, bool is2DUI);
     const std::vector<D3DVERTEXELEMENT9>& currentElements();
     void traceDraw(const char* kind, UINT prims);
     void noteUnimplemented(const char* what);
