@@ -159,7 +159,9 @@ echo 0 | sudo tee /sys/class/vtconsole/vtcon1/bind > /dev/null 2>&1 || true
 # These feed the game's OWN PC graphics options (the registry values its Options
 # menu writes), so the game renders exactly as it would on PC with those settings.
 # Override in "$GAMEDIR/nfsu2.cfg", e.g.:
-#   NFSU2_GRAPHICS=quality      # performance | balanced | quality
+#   NFSU2_GRAPHICS=quality      # potato_1..3 | performance | balanced | quality
+#   NFSU2_POTATO=0..3           # 0 off, 1 lowest LOD, 2 PS1 Nearest 32px, 3 Witcher Clay 8px
+#   NFSU2_DRAW_BUDGET=0         # target max items/frame (0 = off/fixed dist, e.g. 260..420)
 #   NFSU2_FPS=30                # 30 or 60
 #   NFSU2_REGISTRY_EXTRA="g_CrowdEnable=0"   # any extra g_* option
 #   NFSU2_GPU_EXTRAS=1          # test: options that cost GPU time but no CPU time (trilinear texture
@@ -167,6 +169,11 @@ echo 0 | sudo tee /sys/class/vtconsole/vtcon1/bind > /dev/null 2>&1 || true
 #   NFSU2_GPU_EXTRAS=ab         # alternate off/on at every launch (to compare two sessions' logs)
 #   NFSU2_DRAW_DIST=200         # metres; scenery wholly beyond it is not drawn and the fog reaches
 #                               # opaque at that distance, so nothing visibly pops (0 = the game's own)
+#   NFSU2_HALF_REFLECT=2        # car envmap update divider while driving: 0 off (default), 2 = 1/2 rate, N = 1/N
+#   NFSU2_CROWD=0               # override g_CrowdEnable (0 or 1; unset = use profile default)
+#   NFSU2_PARTICLES=0           # override g_ParticleSystemEnable (0 or 1; unset = use profile default)
+#   NFSU2_DISTANT_AI_RATE=2     # distant AI car physics/controller divider: 0 off (default), 2..4 = 1/N rate
+#   NFSU2_DISTANT_AI_DIST=45    # metres from player car beyond which distant AI throttling applies
 # Display (the game adapts to the handheld's own screen; nothing to set on a 640x480 R36S):
 #   NFSU2_ASPECT=auto           # auto: widescreen on 16:9 etc. panels, 4:3 with bars on narrower ones
 #                               # 4:3: always 4:3 (black bars on the sides of a wide screen)
@@ -177,14 +184,48 @@ echo 0 | sudo tee /sys/class/vtconsole/vtcon1/bind > /dev/null 2>&1 || true
 #   NFSU2_SHOW_FPS=1            # frame counter on from the start (Select + R3 toggles it in game)
 # ---------------------------------------------------------------------------
 NFSU2_GRAPHICS=balanced
+NFSU2_POTATO=""
 NFSU2_FPS=60
 NFSU2_REGISTRY_EXTRA=""
 NFSU2_GPU_EXTRAS=0
-NFSU2_DRAW_DIST=200
+NFSU2_DRAW_DIST=""
+NFSU2_DRAW_BUDGET=""
+NFSU2_RENDER_SCALE=""
 NFSU2_LANG=Spanish
+NFSU2_HALF_REFLECT=0
+NFSU2_CAR_REFLECT=""
+NFSU2_HEADLIGHTS=""
+NFSU2_CROWD=""
+NFSU2_PARTICLES=""
+NFSU2_DISTANT_AI_RATE=""
+NFSU2_DISTANT_AI_DIST=""
 [ -f "$GAMEDIR/nfsu2.cfg" ] && . "$GAMEDIR/nfsu2.cfg"
-export NFSU2_DRAW_DIST NFSU2_LANG
-for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS; do
+case "$NFSU2_GRAPHICS" in
+  potato_1)
+    [ -z "$NFSU2_POTATO" ] && NFSU2_POTATO=1
+    [ -z "$NFSU2_DRAW_DIST" ] && NFSU2_DRAW_DIST=200
+    [ -z "$NFSU2_DRAW_BUDGET" ] && NFSU2_DRAW_BUDGET=0
+    ;;
+  potato_2)
+    [ -z "$NFSU2_POTATO" ] && NFSU2_POTATO=2
+    [ -z "$NFSU2_DRAW_DIST" ] && NFSU2_DRAW_DIST=200
+    [ -z "$NFSU2_DRAW_BUDGET" ] && NFSU2_DRAW_BUDGET=0
+    ;;
+  potato_3)
+    [ -z "$NFSU2_POTATO" ] && NFSU2_POTATO=3
+    [ -z "$NFSU2_DRAW_DIST" ] && NFSU2_DRAW_DIST=200
+    [ -z "$NFSU2_DRAW_BUDGET" ] && NFSU2_DRAW_BUDGET=0
+    ;;
+  *)
+    [ -z "$NFSU2_POTATO" ] && NFSU2_POTATO=0
+    [ -z "$NFSU2_DRAW_DIST" ] && NFSU2_DRAW_DIST=200
+    [ -z "$NFSU2_DRAW_BUDGET" ] && NFSU2_DRAW_BUDGET=0
+    ;;
+esac
+[ -z "$NFSU2_DISTANT_AI_RATE" ] && NFSU2_DISTANT_AI_RATE=0
+[ -z "$NFSU2_DISTANT_AI_DIST" ] && NFSU2_DISTANT_AI_DIST=45
+export NFSU2_POTATO NFSU2_DRAW_DIST NFSU2_DRAW_BUDGET NFSU2_LANG NFSU2_HALF_REFLECT NFSU2_DISTANT_AI_RATE NFSU2_DISTANT_AI_DIST
+for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS NFSU2_CROWD NFSU2_PARTICLES; do
   eval "[ -n \"\${$v:-}\" ] && export $v"
 done
 # HUD layout table of ThirteenAG's widescreen fix (MIT, see widescreen/LICENSE), used on wide screens
@@ -193,6 +234,10 @@ export NFSU2_WIDESCREEN_DAT="$GAMEDIR/widescreen/NFSUnderground2.WidescreenFix.d
 
 COMMON="NotFirstTime=1;g_MotionBlurEnable=0;g_LightStreaksEnable=0;g_DepthOfFieldEnable=0;g_OverBrightEnable=0;g_BleachByPassEnable=0;g_FSAALevel=0;g_RainEnable=0;g_RacingResolution=0;g_VSyncOn=0;g_CarDamageEnable=0"
 case "$NFSU2_GRAPHICS" in
+  potato_1)
+    PROFILE="g_PerformanceLevel=0;g_TextureFiltering=0;g_CarEnvironmentMapEnable=0;g_CarEnvironmentMapUpdateData=0;g_CarShadowEnable=0;g_CarHeadlightEnable=1;g_CarLightingEnable=0;g_CrowdEnable=0;g_RoadReflectionEnable=0;g_FogEnable=1;g_HorizonFogEnable=1;g_LightGlowEnable=0;g_AnimatedTextureEnable=0;g_ParticleSystemEnable=0;g_WorldLodLevel=0;g_CarLodLevel=0;g_TintingEnable=0" ;;
+  potato_2|potato_3)
+    PROFILE="g_PerformanceLevel=0;g_TextureFiltering=0;g_CarEnvironmentMapEnable=0;g_CarEnvironmentMapUpdateData=0;g_CarShadowEnable=0;g_CarHeadlightEnable=0;g_CarLightingEnable=0;g_CrowdEnable=0;g_RoadReflectionEnable=0;g_FogEnable=1;g_HorizonFogEnable=1;g_LightGlowEnable=0;g_AnimatedTextureEnable=0;g_ParticleSystemEnable=0;g_WorldLodLevel=0;g_CarLodLevel=0;g_TintingEnable=0" ;;
   performance)
     PROFILE="g_PerformanceLevel=1;g_TextureFiltering=1;g_CarEnvironmentMapEnable=0;g_CarEnvironmentMapUpdateData=0;g_CarShadowEnable=1;g_CarHeadlightEnable=1;g_CarLightingEnable=1;g_CrowdEnable=0;g_RoadReflectionEnable=0;g_FogEnable=1;g_HorizonFogEnable=1;g_LightGlowEnable=0;g_AnimatedTextureEnable=1;g_ParticleSystemEnable=0;g_WorldLodLevel=0;g_CarLodLevel=0;g_TintingEnable=0" ;;
   quality)
@@ -206,8 +251,17 @@ if [ "$NFSU2_GPU_EXTRAS" = "ab" ]; then
 fi
 GPU_EXTRAS=""
 [ "$NFSU2_GPU_EXTRAS" = "1" ] && GPU_EXTRAS="g_TextureFiltering=2;g_TintingEnable=1;g_CarLodLevel=1"
-export NFSU2_REGISTRY="$COMMON;$PROFILE${GPU_EXTRAS:+;$GPU_EXTRAS}${NFSU2_REGISTRY_EXTRA:+;$NFSU2_REGISTRY_EXTRA}"
-CAP_ARG="--cap60"; [ "$NFSU2_FPS" = "30" ] && CAP_ARG="--cap30"
+TRADE_OFFS=""
+if [ "${NFSU2_CAR_REFLECT:-}" = "0" ]; then
+  TRADE_OFFS="${TRADE_OFFS:+${TRADE_OFFS};}g_CarEnvironmentMapEnable=0;g_CarEnvironmentMapUpdateData=0"
+elif [ "${NFSU2_CAR_REFLECT:-}" = "1" ]; then
+  TRADE_OFFS="${TRADE_OFFS:+${TRADE_OFFS};}g_CarEnvironmentMapEnable=1;g_CarEnvironmentMapUpdateData=1"
+fi
+[ -n "${NFSU2_HEADLIGHTS:-}" ] && TRADE_OFFS="${TRADE_OFFS:+${TRADE_OFFS};}g_CarHeadlightEnable=$NFSU2_HEADLIGHTS"
+[ -n "${NFSU2_CROWD:-}" ] && TRADE_OFFS="${TRADE_OFFS:+${TRADE_OFFS};}g_CrowdEnable=$NFSU2_CROWD"
+[ -n "${NFSU2_PARTICLES:-}" ] && TRADE_OFFS="${TRADE_OFFS:+${TRADE_OFFS};}g_ParticleSystemEnable=$NFSU2_PARTICLES"
+export NFSU2_REGISTRY="$COMMON;$PROFILE${GPU_EXTRAS:+;$GPU_EXTRAS}${TRADE_OFFS:+;$TRADE_OFFS}${NFSU2_REGISTRY_EXTRA:+;$NFSU2_REGISTRY_EXTRA}"
+CAP_ARG="--cap=${NFSU2_FPS:-30}"
 
 # Record the clocks actually in effect (launcher.log next to log.txt)
 {

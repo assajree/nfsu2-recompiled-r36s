@@ -46,6 +46,7 @@ thread_local bool g_glesDeferTextureGL = false;
 // Panel rotation in degrees (0, 90, 270), set by the host before the device exists (main.cpp, NFSU2_ROTATE).
 uint32_t g_nfsScreenRotation = 0;
 extern "C" void nfs_widescreen_set_resolution(unsigned width, unsigned height);
+extern "C" float nfs_effective_draw_dist(void) __attribute__((weak));
 
 namespace {
 std::mutex g_windowMutex;
@@ -1360,6 +1361,10 @@ IDirect3DDevice9GLES::IDirect3DDevice9GLES(IDirect3D9GLES* parentD3D, SDL_Window
     caps.elementIndexUint = hasGLExtension("GL_OES_element_index_uint");
     caps.blendMinMax = hasGLExtension("GL_EXT_blend_minmax");
     caps.halfFloatVertex = hasGLExtension("GL_OES_vertex_half_float");
+    {
+        const char* ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        caps.es3 = ver && std::strstr(ver, "OpenGL ES 3.") != nullptr;
+    }
     glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &m_maxAttribs);
     if (m_maxAttribs > 16) m_maxAttribs = 16;
     std::printf("[D3D9 GLES] caps: npot=%d d24s8=%d uint=%d minmax=%d half=%d attribs=%d\n", caps.npot,
@@ -1479,7 +1484,101 @@ void IDirect3DDevice9GLES::resetStateDefaults() {
     m_scissorRect = {0, 0, static_cast<LONG>(m_rtWidth), static_cast<LONG>(m_rtHeight)};
 }
 
+IDirect3DDevice9GLES* IDirect3DDevice9GLES::s_vaoDevice = nullptr;
+
+void IDirect3DDevice9GLES::vaoBufferDeleteCallback(GLuint buf) {
+    if (s_vaoDevice) s_vaoDevice->invalidateVaoBuffer(buf);
+}
+
+void IDirect3DDevice9GLES::vaoEnsureDefaultCallback() {
+    if (s_vaoDevice) s_vaoDevice->bindDefaultVao();
+}
+
+void IDirect3DDevice9GLES::initVaoCache() {
+    m_vao.initialized = true;
+    static const bool off = std::getenv("NFSU2_VAO") && std::getenv("NFSU2_VAO")[0] == '0';
+    if (off) { std::printf("[D3D9 GLES] VAO cache disabled (NFSU2_VAO=0)\n"); return; }
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+    int major = 0;
+    if (version) {
+        if (const char* es = std::strstr(version, "ES ")) std::sscanf(es + 3, "%d", &major);
+        else std::sscanf(version, "%d", &major);
+    }
+    if (major < 3) return;
+#ifdef __ANDROID__
+    m_vao.genVertexArrays = reinterpret_cast<void (*)(GLsizei, GLuint*)>(eglGetProcAddress("glGenVertexArrays"));
+    m_vao.bindVertexArray = reinterpret_cast<void (*)(GLuint)>(eglGetProcAddress("glBindVertexArray"));
+    m_vao.deleteVertexArrays = reinterpret_cast<void (*)(GLsizei, const GLuint*)>(eglGetProcAddress("glDeleteVertexArrays"));
+#else
+    m_vao.genVertexArrays = reinterpret_cast<void (*)(GLsizei, GLuint*)>(SDL_GL_GetProcAddress("glGenVertexArrays"));
+    m_vao.bindVertexArray = reinterpret_cast<void (*)(GLuint)>(SDL_GL_GetProcAddress("glBindVertexArray"));
+    m_vao.deleteVertexArrays = reinterpret_cast<void (*)(GLsizei, const GLuint*)>(SDL_GL_GetProcAddress("glDeleteVertexArrays"));
+#endif
+    if (!m_vao.genVertexArrays || !m_vao.bindVertexArray || !m_vao.deleteVertexArrays) return;
+    m_vao.available = true;
+    s_vaoDevice = this;
+    glsc::vaoDeleteBufferHook() = &IDirect3DDevice9GLES::vaoBufferDeleteCallback;
+    glsc::vaoEnsureDefaultHook() = &IDirect3DDevice9GLES::vaoEnsureDefaultCallback;
+    std::printf("[D3D9 GLES] VAO cache active (%zu sets x %zu ways = %zu slots; NFSU2_VAO=0 disables)\n",
+                kVaoSets, kVaoWays, kVaoSets * kVaoWays);
+}
+
+void IDirect3DDevice9GLES::destroyVaoCache() {
+    if (s_vaoDevice == this) {
+        glsc::vaoDeleteBufferHook() = nullptr;
+        glsc::vaoEnsureDefaultHook() = nullptr;
+        s_vaoDevice = nullptr;
+    }
+    if (!m_vao.available) return;
+    if (m_vao.currentVao != 0) {
+        m_vao.bindVertexArray(0);
+        m_vao.currentVao = 0;
+    }
+    for (auto& e : m_vao.entries) {
+        if (e.vao) {
+            m_vao.deleteVertexArrays(1, &e.vao);
+            e.vao = 0;
+        }
+        e.valid = false;
+    }
+    if (m_vao.hits + m_vao.misses > 0) {
+        std::printf("[D3D9 GLES] VAO cache stats: hits=%llu misses=%llu evictions=%llu (hit rate %.1f%%)\n",
+                    static_cast<unsigned long long>(m_vao.hits),
+                    static_cast<unsigned long long>(m_vao.misses),
+                    static_cast<unsigned long long>(m_vao.evictions),
+                    100.0 * static_cast<double>(m_vao.hits) / static_cast<double>(m_vao.hits + m_vao.misses));
+    }
+    m_vao.available = false;
+}
+
+void IDirect3DDevice9GLES::bindDefaultVao() {
+    if (m_vao.available && m_vao.currentVao != 0) {
+        m_vao.bindVertexArray(0);
+        m_vao.currentVao = 0;
+        glsc::onVaoSwitchedToDefault();
+        for (bool& e : m_attribEnabled) e = false;
+    }
+}
+
+void IDirect3DDevice9GLES::invalidateVaoBuffer(GLuint buf) {
+    if (!m_vao.available || !buf) return;
+    for (auto& e : m_vao.entries) {
+        if (!e.valid) continue;
+        bool match = (e.key.ibo == buf);
+        if (!match) {
+            for (uint8_t i = 0; i < e.key.count; ++i) {
+                if (e.key.a[i].vbo == buf) { match = true; break; }
+            }
+        }
+        if (match) {
+            if (m_vao.currentVao == e.vao) bindDefaultVao();
+            e.valid = false;
+        }
+    }
+}
+
 IDirect3DDevice9GLES::~IDirect3DDevice9GLES() {
+    destroyVaoCache();
     if (m_fbo) glDeleteFramebuffers(1, &m_fbo);
     if (m_dummy2D) glDeleteTextures(1, &m_dummy2D);
     if (m_dummyCube) glDeleteTextures(1, &m_dummyCube);
@@ -1891,6 +1990,7 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         (void)glAcc;
     }
     if (vkbd::state().visible.load()) {
+        bindDefaultVao();
         const UINT w = m_presentParams.BackBufferWidth ? m_presentParams.BackBufferWidth : 640;
         const UINT h = m_presentParams.BackBufferHeight ? m_presentParams.BackBufferHeight : 480;
         drawVirtualKeyboard(static_cast<int>(w), static_cast<int>(h), m_bbFbo);
@@ -1900,6 +2000,7 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         m_fboDirty = true;
     }
     if (g_fpsOverlay.load(std::memory_order_relaxed)) {
+        bindDefaultVao();
         const UINT w = m_presentParams.BackBufferWidth ? m_presentParams.BackBufferWidth : 640;
         const UINT h = m_presentParams.BackBufferHeight ? m_presentParams.BackBufferHeight : 480;
         drawFpsCounter(static_cast<int>(w), static_cast<int>(h), m_bbFbo);
@@ -2169,6 +2270,7 @@ void IDirect3DDevice9GLES::createBackBufferTarget(UINT width, UINT height) {
 }
 
 void IDirect3DDevice9GLES::presentBackBuffer() {
+    bindDefaultVao();
     static GLuint prog = 0;
     static GLint texLoc = -1;
     scaleBlit(m_bbTex, static_cast<float>(m_defaultBackBuffer->getWidth()), static_cast<float>(m_defaultBackBuffer->getHeight()),
@@ -2972,7 +3074,7 @@ static GLint glWrap(DWORD a) {
     }
 }
 
-void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* tex) {
+void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* tex, bool is2DUI) {
     GLTextureObject* obj = nullptr;
     if (tex->GetType() == D3DRTYPE_TEXTURE) obj = static_cast<IDirect3DTexture9GLES*>(tex)->glObject();
     else if (tex->GetType() == D3DRTYPE_CUBETEXTURE) obj = static_cast<IDirect3DCubeTexture9GLES*>(tex)->glObject();
@@ -2989,16 +3091,41 @@ void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* 
     if (mipF == D3DTEXF_NONE) glMin = minPoint ? GL_NEAREST : GL_LINEAR;
     else if (mipF == D3DTEXF_POINT) glMin = minPoint ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_NEAREST;
     else glMin = minPoint ? GL_NEAREST_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_LINEAR;
-    const GLint glMag = (magF == D3DTEXF_POINT || magF == D3DTEXF_NONE) ? GL_NEAREST : GL_LINEAR;
+    GLint glMag = (magF == D3DTEXF_POINT || magF == D3DTEXF_NONE) ? GL_NEAREST : GL_LINEAR;
+    static const int potato = [] {
+        const char* e = std::getenv("NFSU2_POTATO");
+        int v = e ? std::atoi(e) : 0;
+        return v < 0 ? 0 : (v > 3 ? 3 : v);
+    }();
+    GLint targetBase = 0;
+    if (potato >= 2 && !is2DUI && obj->mipmapped() && !obj->renderTarget && obj->target == GL_TEXTURE_2D) {
+        const UINT maxDim = (potato == 2) ? 32u : 8u;
+        UINT d = std::max(obj->width, obj->height);
+        while (d > maxDim && static_cast<UINT>(targetBase + 1) < obj->d3dLevels) {
+            d >>= 1;
+            ++targetBase;
+        }
+        if (potato == 2) {
+            glMin = GL_NEAREST_MIPMAP_NEAREST;
+            glMag = GL_NEAREST;
+        } else {
+            glMin = GL_LINEAR_MIPMAP_LINEAR;
+            glMag = GL_LINEAR;
+        }
+    }
     SamplerParamCache& c = obj->cache;
     const GLenum t = obj->target;
     if (c.wrapS != wrapS) { glTexParameteri(t, GL_TEXTURE_WRAP_S, wrapS); c.wrapS = wrapS; }
     if (c.wrapT != wrapT) { glTexParameteri(t, GL_TEXTURE_WRAP_T, wrapT); c.wrapT = wrapT; }
     if (c.minF != glMin) { glTexParameteri(t, GL_TEXTURE_MIN_FILTER, glMin); c.minF = glMin; }
     if (c.magF != glMag) { glTexParameteri(t, GL_TEXTURE_MAG_FILTER, glMag); c.magF = glMag; }
+    if (glesCaps().es3 && c.baseLevel != targetBase) {
+        glTexParameteri(t, 0x813C /* GL_TEXTURE_BASE_LEVEL */, targetBase);
+        c.baseLevel = targetBase;
+    }
 }
 
-void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ffpPS, int ffpStages) {
+void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ffpPS, int ffpStages, bool is2DUI) {
     auto bindStage = [&](int stage, bool wantCube) {
         glActiveTexture(GL_TEXTURE0 + stage);
         IDirect3DBaseTexture9* tex = m_boundTextures[stage];
@@ -3009,7 +3136,7 @@ void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ff
         } else {
             glBindTexture(GL_TEXTURE_2D, is2D ? static_cast<IDirect3DTexture9GLES*>(tex)->getGLTexture() : m_dummy2D);
         }
-        if ((wantCube && isCube) || (!wantCube && is2D)) applySamplerParams(stage, tex);
+        if ((wantCube && isCube) || (!wantCube && is2D)) applySamplerParams(stage, tex, is2DUI);
     };
     if (psVariant) {
         for (const auto& s : psVariant->samplers) {
@@ -3024,7 +3151,7 @@ void IDirect3DDevice9GLES::applyTextures(const ShaderVariant* psVariant, bool ff
     glActiveTexture(GL_TEXTURE0);
 }
 
-bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout, bool* instancingUnavailable) {
+bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout, bool* instancingUnavailable, GLuint ibo, bool* vaoBoundIbo) {
     if (m_fboDirty) bindRenderTarget();
     const std::vector<D3DVERTEXELEMENT9>& elems = currentElements();
 
@@ -3190,7 +3317,8 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         std::memcpy(&f[4], &m_rs[D3DRS_FOGSTART], 4);
         std::memcpy(&f[5], &m_rs[D3DRS_FOGEND], 4);
         std::memcpy(&f[6], &m_rs[D3DRS_FOGDENSITY], 4);
-        static const float drawDist = [] { const char* e = std::getenv("NFSU2_DRAW_DIST"); return e ? static_cast<float>(std::atof(e)) : 0.0f; }();
+        static const float envDrawDist = [] { const char* e = std::getenv("NFSU2_DRAW_DIST"); return e ? static_cast<float>(std::atof(e)) : 0.0f; }();
+        const float drawDist = nfs_effective_draw_dist ? nfs_effective_draw_dist() : envDrawDist;
         f[7] = drawDist;
         if (drawDist > 0 && lp->fogRadLoc != -1) {
             const float vw = static_cast<float>(m_viewport.Width ? m_viewport.Width : 1), vh = static_cast<float>(m_viewport.Height ? m_viewport.Height : 1);
@@ -3214,61 +3342,195 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
     }
 
     // ---- vertex attributes ----
-    bool used[16] = {};
-    for (int i = 0; i < elemCount; ++i) {
-        const int loc = elemLoc[i];
-        if (loc < 0 || loc >= m_maxAttribs || used[loc]) continue;
-        const auto& e = elems[i];
-        const uint8_t* ptr = nullptr;
-        GLsizei stride = 0;
-        if (upData && e.Stream == 0) {
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            ptr = static_cast<const uint8_t*>(upData) + e.Offset + static_cast<intptr_t>(baseVertex) * upStride;
-            stride = static_cast<GLsizei>(upStride);
-        } else {
-            const StreamBinding& sb = m_streams[e.Stream];
-            if (!sb.buffer) continue;
-            const int64_t off = static_cast<int64_t>(sb.offset) + e.Offset + static_cast<int64_t>(baseVertex) * sb.stride;
-            if (off < 0) continue;
-            glBindBuffer(GL_ARRAY_BUFFER, sb.buffer->getVBO());
-            ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(off));
-            stride = static_cast<GLsizei>(sb.stride);
+    if (vaoBoundIbo) *vaoBoundIbo = false;
+    bool usedVao = false;
+    if (!upData && !instanceLayout && elemCount > 0 && elemCount <= 8) {
+        if (!m_vao.initialized) initVaoCache();
+        if (m_vao.available) {
+            VaoKey key{};
+            key.ibo = ibo;
+            uint16_t usedMask = 0;
+            bool ok = true;
+            for (int i = 0; i < elemCount; ++i) {
+                const int loc = elemLoc[i];
+                if (loc < 0 || loc >= m_maxAttribs || (usedMask & (1u << loc))) continue;
+                const auto& e = elems[i];
+                const StreamBinding& sb = m_streams[e.Stream];
+                if (!sb.buffer) continue;
+                const int64_t off = static_cast<int64_t>(sb.offset) + e.Offset + static_cast<int64_t>(baseVertex) * sb.stride;
+                if (off < 0 || off > 0xFFFFFFFFLL || sb.stride > 0xFFFFu) { ok = false; break; }
+                GLint size = 4;
+                GLenum type = GL_FLOAT;
+                GLboolean norm = GL_FALSE;
+                switch (e.Type) {
+                    case D3DDECLTYPE_FLOAT1: size = 1; break;
+                    case D3DDECLTYPE_FLOAT2: size = 2; break;
+                    case D3DDECLTYPE_FLOAT3: size = 3; break;
+                    case D3DDECLTYPE_FLOAT4: size = 4; break;
+                    case D3DDECLTYPE_D3DCOLOR: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_UBYTE4: type = GL_UNSIGNED_BYTE; break;
+                    case D3DDECLTYPE_UBYTE4N: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_SHORT2: size = 2; type = GL_SHORT; break;
+                    case D3DDECLTYPE_SHORT4: type = GL_SHORT; break;
+                    case D3DDECLTYPE_SHORT2N: size = 2; type = GL_SHORT; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_SHORT4N: type = GL_SHORT; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_USHORT2N: size = 2; type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_USHORT4N: type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
+                    case D3DDECLTYPE_FLOAT16_2: size = 2; type = 0x8D61; break;
+                    case D3DDECLTYPE_FLOAT16_4: type = 0x8D61; break;
+                    default:
+                        noteUnimplemented("vertex element type UDEC3/DEC3N");
+                        continue;
+                }
+                VaoAttribKey& ak = key.a[key.count++];
+                ak.loc = static_cast<uint8_t>(loc);
+                ak.size = static_cast<uint8_t>(size);
+                ak.norm = static_cast<uint8_t>(norm);
+                ak.pad = 0;
+                ak.type = static_cast<uint16_t>(type);
+                ak.stride = static_cast<uint16_t>(sb.stride);
+                ak.vbo = sb.buffer->getVBO();
+                ak.offset = static_cast<uint32_t>(off);
+                usedMask |= static_cast<uint16_t>(1u << loc);
+            }
+            if (ok && key.count > 0) {
+                // FNV-1a 64-bit hash over active portion of VaoKey
+                uint64_t h = 14695981039346656037ULL;
+                const uint8_t* kb = reinterpret_cast<const uint8_t*>(&key);
+                const size_t klen = offsetof(VaoKey, a) + static_cast<size_t>(key.count) * sizeof(VaoAttribKey);
+                for (size_t b = 0; b < klen; ++b) { h ^= kb[b]; h *= 1099511628211ULL; }
+                const size_t setIdx = static_cast<size_t>(h & (kVaoSets - 1));
+                VaoEntry* base = &m_vao.entries[setIdx * kVaoWays];
+                VaoEntry* hit = nullptr;
+                for (size_t w = 0; w < kVaoWays; ++w) {
+                    if (base[w].valid && base[w].key.count == key.count && base[w].key.ibo == key.ibo &&
+                        std::memcmp(base[w].key.a, key.a, static_cast<size_t>(key.count) * sizeof(VaoAttribKey)) == 0) {
+                        hit = &base[w];
+                        break;
+                    }
+                }
+                if (hit) {
+                    ++m_vao.hits;
+                    if (m_vao.currentVao != hit->vao) {
+                        m_vao.bindVertexArray(hit->vao);
+                        m_vao.currentVao = hit->vao;
+                    }
+                } else {
+                    ++m_vao.misses;
+                    size_t victim = kVaoWays;
+                    for (size_t w = 0; w < kVaoWays; ++w) {
+                        if (!base[w].valid) { victim = w; break; }
+                    }
+                    if (victim == kVaoWays) {
+                        victim = m_vao.setCursor[setIdx];
+                        m_vao.setCursor[setIdx] = static_cast<uint8_t>((victim + 1) & (kVaoWays - 1));
+                        ++m_vao.evictions;
+                    }
+                    VaoEntry& slot = base[victim];
+                    if (!slot.vao) {
+                        m_vao.genVertexArrays(1, &slot.vao);
+                        slot.enabledMask = 0;
+                    }
+                    if (m_vao.currentVao != slot.vao) {
+                        m_vao.bindVertexArray(slot.vao);
+                        m_vao.currentVao = slot.vao;
+                    }
+                    uint16_t toDisable = slot.enabledMask & static_cast<uint16_t>(~usedMask);
+                    while (toDisable) {
+                        const int loc = __builtin_ctz(toDisable);
+                        (glDisableVertexAttribArray)(loc);
+                        toDisable &= static_cast<uint16_t>(toDisable - 1);
+                    }
+                    GLuint lastVbo = 0xFFFFFFFFu;
+                    for (uint8_t k = 0; k < key.count; ++k) {
+                        const VaoAttribKey& ak = key.a[k];
+                        if (ak.vbo != lastVbo) {
+                            (glBindBuffer)(GL_ARRAY_BUFFER, ak.vbo);
+                            glsc::S().arrayBuffer = ak.vbo;
+                            glsc::S().arrayValid = true;
+                            lastVbo = ak.vbo;
+                        }
+                        if (!(slot.enabledMask & (1u << ak.loc))) {
+                            (glEnableVertexAttribArray)(ak.loc);
+                        }
+                        (glVertexAttribPointer)(ak.loc, ak.size, ak.type, ak.norm, ak.stride,
+                                                reinterpret_cast<const void*>(static_cast<uintptr_t>(ak.offset)));
+                    }
+                    (glBindBuffer)(GL_ELEMENT_ARRAY_BUFFER, key.ibo);
+                    slot.key = key;
+                    slot.enabledMask = usedMask;
+                    slot.valid = true;
+                }
+                // Constant vertex attribute values are global context state (not per-VAO).
+                if (!programmableVS && !(usedMask & (1u << kFFPDiffuse))) {
+                    glVertexAttrib4f(kFFPDiffuse, 1.0f, 1.0f, 1.0f, 1.0f);
+                } else if (programmableVS && !(usedMask & (1u << kFFPDiffuse))) {
+                    glVertexAttrib4f(kFFPDiffuse, 0.0f, 0.0f, 0.0f, 1.0f);
+                }
+                if (vaoBoundIbo) *vaoBoundIbo = true;
+                usedVao = true;
+            }
         }
-        GLint size = 4;
-        GLenum type = GL_FLOAT;
-        GLboolean norm = GL_FALSE;
-        switch (e.Type) {
-            case D3DDECLTYPE_FLOAT1: size = 1; break;
-            case D3DDECLTYPE_FLOAT2: size = 2; break;
-            case D3DDECLTYPE_FLOAT3: size = 3; break;
-            case D3DDECLTYPE_FLOAT4: size = 4; break;
-            case D3DDECLTYPE_D3DCOLOR: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
-            case D3DDECLTYPE_UBYTE4: type = GL_UNSIGNED_BYTE; break;
-            case D3DDECLTYPE_UBYTE4N: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
-            case D3DDECLTYPE_SHORT2: size = 2; type = GL_SHORT; break;
-            case D3DDECLTYPE_SHORT4: type = GL_SHORT; break;
-            case D3DDECLTYPE_SHORT2N: size = 2; type = GL_SHORT; norm = GL_TRUE; break;
-            case D3DDECLTYPE_SHORT4N: type = GL_SHORT; norm = GL_TRUE; break;
-            case D3DDECLTYPE_USHORT2N: size = 2; type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
-            case D3DDECLTYPE_USHORT4N: type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
-            case D3DDECLTYPE_FLOAT16_2: size = 2; type = 0x8D61; break;  // GL_HALF_FLOAT_OES
-            case D3DDECLTYPE_FLOAT16_4: type = 0x8D61; break;
-            default:
-                noteUnimplemented("vertex element type UDEC3/DEC3N");
-                continue;
-        }
-        if (!m_attribEnabled[loc]) { glEnableVertexAttribArray(loc); m_attribEnabled[loc] = true; }
-        glVertexAttribPointer(loc, size, type, norm, stride, ptr);
-        used[loc] = true;
     }
-    for (int loc = 0; loc < m_maxAttribs; ++loc) {
-        if (used[loc]) continue;
-        if (m_attribEnabled[loc]) { glDisableVertexAttribArray(loc); m_attribEnabled[loc] = false; }
-        if (!programmableVS && loc == kFFPDiffuse) glVertexAttrib4f(loc, 1.0f, 1.0f, 1.0f, 1.0f);
-        else glVertexAttrib4f(loc, 0.0f, 0.0f, 0.0f, 1.0f);
+    if (!usedVao) {
+        bindDefaultVao();
+        bool used[16] = {};
+        for (int i = 0; i < elemCount; ++i) {
+            const int loc = elemLoc[i];
+            if (loc < 0 || loc >= m_maxAttribs || used[loc]) continue;
+            const auto& e = elems[i];
+            const uint8_t* ptr = nullptr;
+            GLsizei stride = 0;
+            if (upData && e.Stream == 0) {
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                ptr = static_cast<const uint8_t*>(upData) + e.Offset + static_cast<intptr_t>(baseVertex) * upStride;
+                stride = static_cast<GLsizei>(upStride);
+            } else {
+                const StreamBinding& sb = m_streams[e.Stream];
+                if (!sb.buffer) continue;
+                const int64_t off = static_cast<int64_t>(sb.offset) + e.Offset + static_cast<int64_t>(baseVertex) * sb.stride;
+                if (off < 0) continue;
+                glBindBuffer(GL_ARRAY_BUFFER, sb.buffer->getVBO());
+                ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(off));
+                stride = static_cast<GLsizei>(sb.stride);
+            }
+            GLint size = 4;
+            GLenum type = GL_FLOAT;
+            GLboolean norm = GL_FALSE;
+            switch (e.Type) {
+                case D3DDECLTYPE_FLOAT1: size = 1; break;
+                case D3DDECLTYPE_FLOAT2: size = 2; break;
+                case D3DDECLTYPE_FLOAT3: size = 3; break;
+                case D3DDECLTYPE_FLOAT4: size = 4; break;
+                case D3DDECLTYPE_D3DCOLOR: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+                case D3DDECLTYPE_UBYTE4: type = GL_UNSIGNED_BYTE; break;
+                case D3DDECLTYPE_UBYTE4N: type = GL_UNSIGNED_BYTE; norm = GL_TRUE; break;
+                case D3DDECLTYPE_SHORT2: size = 2; type = GL_SHORT; break;
+                case D3DDECLTYPE_SHORT4: type = GL_SHORT; break;
+                case D3DDECLTYPE_SHORT2N: size = 2; type = GL_SHORT; norm = GL_TRUE; break;
+                case D3DDECLTYPE_SHORT4N: type = GL_SHORT; norm = GL_TRUE; break;
+                case D3DDECLTYPE_USHORT2N: size = 2; type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
+                case D3DDECLTYPE_USHORT4N: type = GL_UNSIGNED_SHORT; norm = GL_TRUE; break;
+                case D3DDECLTYPE_FLOAT16_2: size = 2; type = 0x8D61; break;  // GL_HALF_FLOAT_OES
+                case D3DDECLTYPE_FLOAT16_4: type = 0x8D61; break;
+                default:
+                    noteUnimplemented("vertex element type UDEC3/DEC3N");
+                    continue;
+            }
+            if (!m_attribEnabled[loc]) { glEnableVertexAttribArray(loc); m_attribEnabled[loc] = true; }
+            glVertexAttribPointer(loc, size, type, norm, stride, ptr);
+            used[loc] = true;
+        }
+        for (int loc = 0; loc < m_maxAttribs; ++loc) {
+            if (used[loc]) continue;
+            if (m_attribEnabled[loc]) { glDisableVertexAttribArray(loc); m_attribEnabled[loc] = false; }
+            if (!programmableVS && loc == kFFPDiffuse) glVertexAttrib4f(loc, 1.0f, 1.0f, 1.0f, 1.0f);
+            else glVertexAttrib4f(loc, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
     }
 
-    applyTextures(psVar, !m_boundPS, ffpStages);
+    const bool is2DUI = hasPositionT || (upData != nullptr) || !m_rs[D3DRS_ZENABLE];
+    applyTextures(psVar, !m_boundPS, ffpStages, is2DUI);
     applyRenderStates();
     applyViewportAndScissor();
     return true;
@@ -3435,9 +3697,11 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitive(D3DPRIMITIVETYPE Primiti
     }
     traceDraw("DIP", PrimitiveCount);
     if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DIP", PrimitiveCount)) return D3D_OK;
-    if (!prepareDraw(nullptr, 0, BaseVertexIndex)) return D3D_OK;
+    bool vaoBoundIbo = false;
+    const GLuint ibo = m_boundIB->getIBO();
+    if (!prepareDraw(nullptr, 0, BaseVertexIndex, 0, nullptr, ibo, &vaoBoundIbo)) return D3D_OK;
     const bool i16 = m_boundIB->getFormat() == D3DFMT_INDEX16;
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_boundIB->getIBO());
+    if (!vaoBoundIbo) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     { DrawTimer timer;
     glDrawElements(convertPrimitiveType(PrimitiveType), primitiveCountToVertexCount(PrimitiveType, PrimitiveCount),
                    i16 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,

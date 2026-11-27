@@ -22,9 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
 extern void sub_005CF150_orig(void);
 extern uint32_t getD3D9PresentCount(void);
+#define M16(a) (*(uint16_t*)ADDR(a))
 #define M32(a) (*(uint32_t*)ADDR(a))
 #define MF(a) (*(float*)ADDR(a))
 static int validGuest(uint32_t va) { return va >= 0x400000u && va < 0x30000000u; }
@@ -53,7 +55,10 @@ static const Bound* solidBound(uint32_t solid) {
 }
 
 static uint32_t slotItems[23], slotGroups[23], stDiff[10], stDiffIdent;
-static float drawDist = -1;
+static float drawDist = -1, effDist = -1;
+static int drawBudget = -1;
+static uint32_t frameKept = 0, lastBudgetFrame = 0xffffffffu;
+float nfs_effective_draw_dist(void) { return effDist > 0.0f ? effDist : (drawDist > 0.0f ? drawDist : 0.0f); }
 static uint32_t stFrame, stFrames, stItems, stCulled, stNoBound, stHist[8];
 
 /*
@@ -114,8 +119,17 @@ extern void nfsCapBegin(void);
 extern int nfsCapEnd(void);
 extern const void* nfsCapRecs(void);
 extern const uint8_t* nfsCapBytes(void);
+extern uint32_t nfsCapBytesSize(void);
 extern int nfsD3dDeviceCall(uint32_t method, const uint32_t* args, uint32_t* result);
 extern int nfsD3dCall(uint32_t kind, uint32_t method, const uint32_t* args);
+extern int nfs_fx_setup_mode(void);
+extern int nfs_fx_set_matrix(uint32_t fx, uint32_t handle, const float* mat);
+extern int nfs_fx_set_vector(uint32_t fx, uint32_t handle, const float* vec);
+extern int nfs_fx_set_vector_array(uint32_t fx, uint32_t handle, const float* vecs, uint32_t count);
+extern int nfs_fx_set_float(uint32_t fx, uint32_t handle, float val);
+extern int nfs_fx_set_int_array(uint32_t fx, uint32_t handle, const uint32_t* vals, uint32_t count);
+extern int nfs_fx_set_texture_noop(uint32_t fx, uint32_t handle, uint32_t tex);
+extern int nfs_fx_commit_changes(uint32_t fx);
 extern int nfsD3dDrawInstanced(const uint32_t* dip, uint32_t registerCount, const uint16_t* registers, uint32_t instances, const float* data);   /* d3d9_render_thread.inc */
 extern uint32_t nfsD3dTextureChurn(void);              /* d3d9_bridge.cpp: texture objects created or retired so far */
 extern uint32_t nfsD3dObjectSerial(uint32_t handle);   /* d3d9_bridge.cpp: per-object serial, 0 = no such object */
@@ -352,23 +366,606 @@ static void recHead(MatRec* rc, int n, const Head* h) {
     memcpy(rc->sig, h->sig, sizeof rc->sig); rc->vs = h->vs; rc->ps = h->ps;
     rc->valid = 2;  /* complete */
 }
-static void paramCalls(uint32_t it) {
-    const uint32_t view = M32(M32(0x870848) + 4);
-    { const uint32_t a[2] = {M32(it + 0x24), view}; ccall(sub_005BDAF0, 2, a); }
-    if (M32(M32(M32(it + 0x18) + 0x1c) + 0x59c)) {
-        /* push 9; call 48B1B0; push eax; push [it+24]; call 5BD7B0; add esp, 0xc */
-        push32(9); push32(RECOMP_RETADDR); sub_0048B1B0(); const uint32_t v9 = g_eax;
-        { const uint32_t a[2] = {M32(it + 0x24), v9}; ccall(sub_005BD7B0, 2, a); }
-        g_esp += 4;
-    }
-    if (M32(it + 0x1c)) { const uint32_t a[2] = {M32(it + 0x1c), M32(it + 0x24)}; ccall(sub_005BCE50, 2, a); }
-    if (M32(it + 0x20)) { const uint32_t a[2] = {M32(it + 0x20), M32(it + 0x14)}; ccall(sub_005BD1B0, 2, a); }
-}
 /* device call: queued directly when the render thread can take it, else through the guest COM object */
 static void devFast(uint32_t method, int n, const uint32_t* a) {
     uint32_t b[9] = {0};
     for (int i = 0; i < n && i < 9; ++i) b[i] = a[i];
     if (!nfsD3dCall(2, method, b)) devMethod(method, n, a);
+}
+/*
+ * ---- Native material & item parameter setup + CommitChanges (NFSU2_NATIVE_SETUP: 1 default, 0 lifted, 2 verify) ----
+ * Ports sub_005BC940 (full material setup), sub_005BDAF0 (world/view/WVP matrices), sub_005BD7B0 (view 9
+ * projected shadow matrix & color), sub_005BCE50 (per-item car lighting), sub_005BD1B0 (per-item car
+ * material override), and CommitChanges (sub_0066A93B) directly to C using fx_cache.c's native D3DX setters.
+ */
+static int g_setupTiming = -1;
+static uint64_t stSetupTicks[3], stSetupTimingCalls[3]; /* 0: mat, 1: params, 2: commit */
+static uint32_t stSetupVerCalls[6], stSetupVerBad[6];   /* 0: mat, 1: wv, 2: v9, 3: light, 4: ovr, 5: commit */
+static const char* const k_setupNames[6] = {"mat", "wv", "v9", "light", "ovr", "commit"};
+static inline uint64_t setupTicks(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+static inline int setupTimingOn(void) {
+    if (__builtin_expect(g_setupTiming < 0, 0)) { const char* e = getenv("NFSU2_SETUP_TIMING"); g_setupTiming = e && e[0] == '1'; }
+    return g_setupTiming;
+}
+static inline int64_t ftolSetup(double v) {
+    if (!(v == v)) return 0;
+    if (v >= 9223372036854775808.0) return INT64_MAX;
+    if (v < -9223372036854775808.0) return INT64_MIN;
+    return (int64_t)v;
+}
+/* Exact IEEE-754 order of sub_00689A17 (D3DXMatrixMultiply SSE) */
+static inline void matMulSSE(float* out, const float* a, const float* b) {
+    float t[16];
+    for (int c = 0; c < 4; ++c) {
+        const float b0 = b[c], b1 = b[4 + c], b2 = b[8 + c], b3 = b[12 + c];
+        { const float x4 = a[0] * b0, x5 = a[1] * b1, x6 = a[2] * b2, x7 = a[3] * b3; t[c] = (x4 + x5) + (x6 + x7); }
+        { float x5 = a[4] * b0; const float x6 = a[5] * b1, x7 = a[6] * b2; x5 = x5 + x6; x5 = x5 + x7; t[4 + c] = x5 + a[7] * b3; }
+        { float x6 = a[8] * b0; x6 = x6 + a[9] * b1; x6 = x6 + a[10] * b2; t[8 + c] = x6 + a[11] * b3; }
+        { const float x0 = b0 * a[12], x1 = b1 * a[13], x2 = b2 * a[14], x3 = b3 * a[15]; t[12 + c] = (x0 + x1) + (x2 + x3); }
+    }
+    memcpy(out, t, 64);
+}
+static inline double scrollCoord(float t, float rate, int32_t mode, float step) {
+    if (!mode) return (double)MF(0x7D7D3C);
+    double v = (double)t;
+    if (mode == 2) v = (double)(int32_t)(uint32_t)ftolSetup(v / (double)step);
+    v *= (double)rate;
+    return v - (double)(int32_t)(uint32_t)ftolSetup(v);
+}
+static void fxSetMatrix(uint32_t fx, uint32_t handle, const float* mat) {
+    if (nfs_fx_set_matrix(fx, handle, mat)) return;
+    g_esp -= 64; const uint32_t buf = g_esp;
+    memcpy((void*)ADDR(buf), mat, 64);
+    const uint32_t a[3] = {fx, handle, buf};
+    fxMethod(fx, 38, 3, a);
+    g_esp += 64;
+}
+static void fxSetVec(uint32_t fx, uint32_t handle, const float* vec) {
+    if (nfs_fx_set_vector(fx, handle, vec)) return;
+    g_esp -= 16; const uint32_t buf = g_esp;
+    memcpy((void*)ADDR(buf), vec, 16);
+    const uint32_t a[3] = {fx, handle, buf};
+    fxMethod(fx, 34, 3, a);
+    g_esp += 16;
+}
+static void fxSetVecArrGuest(uint32_t fx, uint32_t handle, uint32_t guestPtr, uint32_t count) {
+    if (nfs_fx_set_vector_array(fx, handle, (const float*)ADDR(guestPtr), count)) return;
+    const uint32_t a[4] = {fx, handle, guestPtr, count};
+    fxMethod(fx, 36, 4, a);
+}
+static void fxSetFloat(uint32_t fx, uint32_t handle, float val) {
+    if (nfs_fx_set_float(fx, handle, val)) return;
+    uint32_t bits; memcpy(&bits, &val, 4);
+    const uint32_t a[3] = {fx, handle, bits};
+    fxMethod(fx, 30, 3, a);
+}
+static void fxSetIntArrGuest(uint32_t fx, uint32_t handle, uint32_t guestPtr, uint32_t count) {
+    if (nfs_fx_set_int_array(fx, handle, (const uint32_t*)ADDR(guestPtr), count)) return;
+    const uint32_t a[4] = {fx, handle, guestPtr, count};
+    fxMethod(fx, 28, 4, a);
+}
+static void fxSetTex(uint32_t fx, uint32_t handle, uint32_t tex) {
+    if (nfs_fx_set_texture_noop(fx, handle, tex)) return;
+    const uint32_t a[3] = {fx, handle, tex};
+    fxMethod(fx, 52, 3, a);
+}
+/* Full native port of sub_005BC940(mat); skipTex != 0 only during verify when SetTexture would change texture */
+static int fullMaterialSetup(uint32_t mat, int skipTex) {
+    const uint32_t shader = M32(0x870910);
+    if (!validGuest(shader) || !validGuest(mat)) return 0;
+    const uint32_t matData = M32(mat);
+    if (mat == M32(0x870940) && M32(0x870944) == shader) return 1;
+    M32(0x872F10) += 1;
+    M32(0x870940) = mat;
+    M32(0x870944) = shader;
+    const uint32_t tex = M32(matData + 0x18);
+    if (!tex) return 1;
+    const uint32_t fx = M32(shader + 0x20), tbl = M32(shader + 0x1C);
+    if (!skipTex) fxSetTex(fx, M32(tbl + 0x13C), tex);
+    const int at = M8(mat + 0x55) == 1;
+    M32(0x86EAD8) = at ? 1 : 0; M32(0x86EADC) = at ? 0x5F : 0;
+    const int8_t bm = (int8_t)M8(mat + 0x56);
+    uint32_t be = 1, bs = 5, bd = 6;
+    switch (bm) {
+        case 0: be = 0; bs = 5; bd = 6; break;
+        case 2: bd = 2; break;
+        case 5: bs = 7; bd = 8; break;
+        case 6: bs = 7; bd = 2; break;
+        default: break;
+    }
+    M32(0x86EAE0) = be; M32(0x86EAE4) = bs; M32(0x86EAE8) = bd;
+    const uint32_t dev = M32(0x870974);
+    const uint32_t stype = M32(shader + 4);
+    if (!bm) {
+        if (stype == 5) { const uint32_t a[3] = {dev, 0x16, 1}; devFast(57, 3, a); }
+        const uint32_t a[3] = {dev, 0xE, 1}; devFast(57, 3, a);
+    } else if (stype == 5) {
+        { const uint32_t a[3] = {dev, 0x16, 2}; devFast(57, 3, a); }
+        const uint32_t a[3] = {dev, 0xE, 0}; devFast(57, 3, a);
+    } else {
+        const uint32_t a[3] = {dev, 0xE, 0}; devFast(57, 3, a);
+    }
+    fxSetIntArrGuest(fx, M32(tbl + 0x74), 0x86EAD8u, 5);
+    float uv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint32_t hScroll = M32(tbl + 0x8BC);
+    if (hScroll) {
+        if (M32(0x870CE8)) {
+            const float t = (float)((double)(int32_t)M32(0x86518C) * (double)MF(0x784268));
+            if (M8(mat + 0x52) == 3) {
+                uv[0] = (float)((double)(int32_t)(int16_t)M16(mat + 0x5E) * (double)MF(0x7A3664));
+                uv[1] = (float)((double)(int32_t)(int16_t)M16(mat + 0x60) * (double)MF(0x7A3664));
+            } else if ((double)MF(0x870924) == (double)MF(0x7D7D3C) && (double)MF(0x870928) == (double)MF(0x7D7D3C)) {
+                const int32_t smode = (int32_t)(int8_t)M8(mat + 0x52);
+                const float step = (float)((double)(int32_t)(int16_t)M16(mat + 0x58) * (double)MF(0x7A0700));
+                const float rateU = (float)((double)(int32_t)(int16_t)M16(mat + 0x5A) * (double)MF(0x78D964));
+                const float rateV = (float)((double)(int32_t)(int16_t)M16(mat + 0x5C) * (double)MF(0x78D964));
+                uv[0] = (float)scrollCoord(t, rateU, smode, step);
+                uv[1] = (float)scrollCoord(t, rateV, smode, step);
+            } else {
+                const float rateU = (float)((double)MF(0x870924) / (double)(int32_t)(int16_t)M16(mat + 0x44));
+                const float rateV = (float)((double)MF(0x870928) / (double)(int32_t)(int16_t)M16(mat + 0x46));
+                const int32_t smode = (int32_t)M32(0x800504);
+                const float step = MF(0x800508);
+                uv[0] = (float)scrollCoord(t, rateU, smode, step);
+                uv[1] = (float)scrollCoord(t, rateV, smode, step);
+            }
+        }
+        M32(0x870948) = 1;
+    }
+    if (M32(0x870948) && hScroll) {
+        float uvMat[16] = {1,0,0,0, 0,1,0,0, uv[0],uv[1],1,0, 0,0,0,1};
+        fxSetMatrix(fx, M32(tbl + 0x8E4), uvMat);
+        fxSetVec(fx, hScroll, uv);
+    }
+    if (!M8(mat + 0x52)) M32(0x870948) = 0;
+    return 1;
+}
+/* Full native port of sub_005BDAF0(worldMat, view) */
+static int nativeParamWorldView(uint32_t worldMat, uint32_t view) {
+    if (M32(0x803E74) != NFS_VA(0x00689A17)) return 0;
+    M32(0x872EF4) += 1;
+    if (worldMat == 0x872E90u) M32(0x872F00) += 1;
+    const uint32_t shader = M32(0x870910);
+    if (worldMat == M32(0x876850) && shader == M32(0x87684C) && view == M32(0x800534)) return 1;
+    const uint32_t vm = M32(0x832DE0u + view * 0x70u);
+    const uint32_t dev = M32(0x870974);
+    if (view != M32(0x800534)) {
+        if (!M8(shader + 0x18)) {
+            const uint32_t a1[3] = {dev, 2, vm}, a2[3] = {dev, 3, vm + 0x40u};
+            devFast(44, 3, a1); devFast(44, 3, a2);
+        }
+        M32(0x800534) = view;
+        M32(0x872EFC) += 1;
+    } else if (shader != M32(0x87684C) && !M8(shader + 0x18)) {
+        const uint32_t a1[3] = {dev, 2, vm}, a2[3] = {dev, 3, vm + 0x40u};
+        devFast(44, 3, a1); devFast(44, 3, a2);
+    }
+    M32(0x872EF8) += 1;
+    M32(0x87684C) = shader;
+    M32(0x876850) = worldMat;
+    const uint32_t tbl = M32(shader + 0x1C), fx = M32(shader + 0x20);
+    const uint32_t hWV = M32(tbl + 0x934);
+    if (hWV) {
+        float wv[16];
+        matMulSSE(wv, (const float*)ADDR(worldMat), (const float*)ADDR(vm));
+        fxSetMatrix(fx, hWV, wv);
+    }
+    if (!M8(shader + 0x18)) {
+        const uint32_t a[3] = {dev, 0x100u, worldMat};
+        devFast(44, 3, a);
+        return 1;
+    }
+    float wvp[16];
+    matMulSSE(wvp, (const float*)ADDR(worldMat), (const float*)ADDR(vm + 0x80u));
+    fxSetMatrix(fx, M32(tbl + 0x95C), wvp);
+    return 1;
+}
+/* Full native port of sub_005BD7B0(worldMat, view9Rec) */
+static int nativeParamView9(uint32_t worldMat, uint32_t view9Rec) {
+    const uint32_t shader = M32(0x870910);
+    if (M32(0x803E74) != NFS_VA(0x00689A17) || !M8(shader + 0x18)) return 0;
+    const uint32_t vp9 = M32(view9Rec) + 0x80u;
+    const uint32_t fx = M32(shader + 0x20), tbl = M32(shader + 0x1C);
+    const float bias[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, MF(0x80052C), MF(0x800530), 0, 1};
+    float tmp[16];
+    matMulSSE(tmp, (const float*)ADDR(worldMat), (const float*)ADDR(vp9));
+    matMulSSE(tmp, tmp, bias);
+    fxSetMatrix(fx, M32(tbl + 0x5C4), tmp);
+    uint32_t col = 0;
+    const uint32_t p0 = M32(0x8900B4);
+    if (p0 && M32(p0 + 4)) {
+        const uint32_t p1 = M32(M32(p0 + 4) + 0x554);
+        if (p1) col = M32(p1 + 0x380);
+    }
+    const double inv255 = (double)MF(0x787AF0);
+    const float vec[4] = {
+        (float)((double)(col & 0xFFu) * inv255),
+        (float)((double)((col >> 8) & 0xFFu) * inv255),
+        (float)((double)((col >> 16) & 0xFFu) * inv255),
+        0.0f
+    };
+    fxSetVec(fx, M32(tbl + 0x574), vec);
+    return 1;
+}
+/* Full native port of sub_005BCE50(lightCtx, worldMat) (shader path) */
+static int nativeParamLight(uint32_t lightCtx, uint32_t worldMat) {
+    (void)worldMat;
+    const uint32_t shader = M32(0x870910);
+    const uint32_t stype = M32(shader + 4);
+    if (stype == 5 && !M8(shader + 0x18)) return 0;
+    if (stype == 5 || stype == 4) {
+        const uint32_t fx = M32(shader + 0x20), tbl = M32(shader + 0x1C);
+        fxSetVecArrGuest(fx, M32(tbl + 0x4FC), lightCtx + 0x120u, 10);
+        fxSetVec(fx, M32(tbl + 0x5EC), (const float*)ADDR(lightCtx + 0xC0u));
+    }
+    return 1;
+}
+/* Full native port of sub_005BD1B0(matOvr, flags) (shader path) */
+static int nativeParamMatOverride(uint32_t esi, uint32_t flags) {
+    const uint32_t shader = M32(0x870910);
+    const uint32_t stype = M32(shader + 4);
+    if (stype == 5 && !M8(shader + 0x18)) return 0;
+    if (stype != 5 && stype != 4) return 1;
+    float v10[4], v20[4], v30[4], v40[4], v50[4], v60[4];
+    v10[0] = (float)((double)MF(esi + 0x34) * (double)MF(esi + 0x30));
+    v10[1] = (float)((double)MF(esi + 0x38) * (double)MF(esi + 0x30));
+    v10[2] = (float)((double)MF(esi + 0x3C) * (double)MF(esi + 0x30));
+    v10[3] = MF(esi + 0x50);
+    v40[0] = (float)((double)MF(esi + 0x44) * (double)MF(esi + 0x40) - (double)v10[0]);
+    v40[1] = (float)((double)MF(esi + 0x48) * (double)MF(esi + 0x40) - (double)v10[1]);
+    v40[2] = (float)((double)MF(esi + 0x4C) * (double)MF(esi + 0x40) - (double)v10[2]);
+    v40[3] = (float)((double)MF(esi + 0x54) - (double)v10[3]);
+    v20[0] = (float)((double)MF(esi + 0x60) * (double)MF(esi + 0x5C));
+    v20[1] = (float)((double)MF(esi + 0x64) * (double)MF(esi + 0x5C));
+    v20[2] = (float)((double)MF(esi + 0x68) * (double)MF(esi + 0x5C));
+    v20[3] = 0.0f;
+    v60[0] = (float)((double)MF(esi + 0x70) * (double)MF(esi + 0x6C) - (double)v20[0]);
+    v60[1] = (float)((double)MF(esi + 0x74) * (double)MF(esi + 0x6C) - (double)v20[1]);
+    v60[2] = (float)((double)MF(esi + 0x78) * (double)MF(esi + 0x6C) - (double)v20[2]);
+    v60[3] = 0.0f;
+    const double half = (double)MF(0x784260);
+    v30[0] = (float)(((double)MF(esi + 0x84) * (double)MF(esi + 0x80)) * half);
+    v30[1] = (float)(((double)MF(esi + 0x88) * (double)MF(esi + 0x80)) * half);
+    v30[2] = (float)(((double)MF(esi + 0x8C) * (double)MF(esi + 0x80)) * half);
+    v30[3] = 0.0f;
+    v50[0] = (float)((((double)MF(esi + 0x94) * (double)MF(esi + 0x90)) * half) - (double)v30[0]);
+    v50[1] = (float)((((double)MF(esi + 0x98) * (double)MF(esi + 0x90)) * half) - (double)v30[1]);
+    v50[2] = (float)((((double)MF(esi + 0x9C) * (double)MF(esi + 0x90)) * half) - (double)v30[2]);
+    v50[3] = 0.0f;
+    if ((flags & 0x100u) && M32(0x870CB8)) {
+        if (!(flags & 0x80u)) {
+            memset(v10, 0, 16); memset(v40, 0, 16); memset(v20, 0, 16); memset(v60, 0, 16);
+        }
+    } else {
+        memset(v30, 0, 16); memset(v50, 0, 16);
+    }
+    const uint32_t fx = M32(shader + 0x20), tbl = M32(shader + 0x1C);
+    fxSetVec(fx, M32(tbl + 0x164), v10);
+    fxSetVec(fx, M32(tbl + 0x18C), v40);
+    if (stype == 5) {
+        fxSetVec(fx, M32(tbl + 0x7CC), v20);
+        fxSetVec(fx, M32(tbl + 0x81C), v60);
+        fxSetVec(fx, M32(tbl + 0x2A4), v30);
+        fxSetVec(fx, M32(tbl + 0x27C), v50);
+        fxSetFloat(fx, M32(tbl + 0x7F4), (float)((double)MF(0x800B94) * (double)MF(esi + 0x58)));
+        fxSetFloat(fx, M32(tbl + 0x2CC), MF(esi + 0x7C));
+    }
+    return 1;
+}
+
+/* ---- Verify harness for NFSU2_NATIVE_SETUP=2 ---- */
+typedef struct { uint32_t fx, oldN; } FxDirtySnap;
+typedef struct { uint32_t ptr, len; uint8_t orig[160], nat[160]; } ParamSnap;
+static void snapAddFx(FxDirtySnap* snaps, int* nsnap, uint32_t fx) {
+    if (!validGuest(fx)) return;
+    for (int i = 0; i < *nsnap; ++i) if (snaps[i].fx == fx) return;
+    if (*nsnap < 32) { snaps[*nsnap].fx = fx; snaps[*nsnap].oldN = M32(fx + 0x10C); ++*nsnap; }
+}
+static void snapAddHandle(uint32_t fx, uint32_t handle, uint32_t len, ParamSnap* ps, int* nps, FxDirtySnap* fxs, int* nfxs) {
+    if ((int32_t)handle >= 0 || !len || len > 160 || *nps >= 8) return;
+    const uint32_t param = ~handle;
+    if (!validGuest(param)) return;
+    const uint32_t ptr = M32(param);
+    if (!validGuest(ptr)) return;
+    ps[*nps].ptr = ptr; ps[*nps].len = len;
+    memcpy(ps[*nps].orig, (const void*)ADDR(ptr), len);
+    ++*nps;
+    snapAddFx(fxs, nfxs, fx);
+    const uint32_t pInfo = M32(M32(fx + 0xB0) + M32(param + 0x14) * 4);
+    const uint32_t pool = validGuest(pInfo) ? M32(pInfo + 0x40) : 0;
+    if (validGuest(pool)) {
+        uint32_t s = M32(pool + 0x10);
+        for (int g = 0; g < 64 && s != pool && validGuest(s); ++g, s = M32(s + 0x10)) snapAddFx(fxs, nfxs, M32(s));
+    }
+}
+static void undoFxDirty(const FxDirtySnap* fxs, int nfxs) {
+    for (int k = 0; k < nfxs; ++k) {
+        const uint32_t fx = fxs[k].fx, oldN = fxs[k].oldN, curN = M32(fx + 0x10C);
+        const uint32_t dl = M32(fx + 0x108), passes = M32(fx + 0x2C);
+        for (uint32_t i = oldN; i < curN; ++i) {
+            const uint32_t passPtr = passes + (uint32_t)M16(dl + i * 4) * 0x64u;
+            const uint32_t st = M32(passPtr + 4) + (uint32_t)M16(dl + i * 4 + 2) * 0x64u;
+            M32(st + 0x30) &= ~2u;
+        }
+        M32(fx + 0x10C) = oldN;
+    }
+}
+static void setupBad(int k, const char* what, uint32_t a, uint32_t nat, uint32_t lift) {
+    if (stSetupVerBad[k]++ < 12)
+        printf("[NFSU2 SETUP] %s mismatch: %s %08x native %08x lifted %08x\n", k_setupNames[k], what, a, nat, lift);
+}
+static void verifySetupGlobalsAndParams(int k, uint32_t fx, int checkDirty,
+        const uint32_t* natG, const uint32_t* liftG, int ng,
+        const ParamSnap* ps, int nps, uint32_t oldN, uint32_t natN, const uint32_t* natDl) {
+    ++stSetupVerCalls[k];
+    for (int i = 0; i < ng; ++i) if (natG[i] != liftG[i]) setupBad(k, "global", (uint32_t)i, natG[i], liftG[i]);
+    for (int i = 0; i < nps; ++i) if (memcmp(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len)) setupBad(k, "param", ps[i].ptr, *(const uint32_t*)ps[i].nat, M32(ps[i].ptr));
+    if (checkDirty && validGuest(fx)) {
+        const uint32_t liftN = M32(fx + 0x10C);
+        if (liftN != natN) setupBad(k, "dirtyN", fx, natN, liftN);
+        else if (natN > oldN && natN - oldN <= 64) {
+            const uint32_t dl = M32(fx + 0x108);
+            if (memcmp(natDl, (const void*)ADDR(dl + oldN * 4u), (natN - oldN) * 4u))
+                setupBad(k, "dirtyList", fx, natDl[0], M32(dl + oldN * 4u));
+        }
+    }
+}
+static void fullMaterialSetupCall(uint32_t mat) {
+    const int mode = nfs_fx_setup_mode();
+    const uint64_t t0 = setupTimingOn() ? setupTicks() : 0;
+    if (mode == 0) {
+        const uint32_t a[1] = {mat}; ccall(sub_005BC940, 1, a);
+    } else if (mode == 1) {
+        if (!fullMaterialSetup(mat, 0)) { const uint32_t a[1] = {mat}; ccall(sub_005BC940, 1, a); }
+    } else {
+        const uint32_t shader = M32(0x870910);
+        const uint32_t fx = validGuest(shader) ? M32(shader + 0x20) : 0;
+        const uint32_t tbl = validGuest(shader) ? M32(shader + 0x1C) : 0;
+        const uint32_t matData = validGuest(mat) ? M32(mat) : 0;
+        const uint32_t tex = validGuest(matData) ? M32(matData + 0x18) : 0;
+        const int texNoop = validGuest(fx) && validGuest(tbl) && (!tex || nfs_fx_set_texture_noop(fx, M32(tbl + 0x13C), tex));
+        static const uint32_t gAddr[9] = {0x872F10, 0x870940, 0x870944, 0x870948, 0x86EAD8, 0x86EADC, 0x86EAE0, 0x86EAE4, 0x86EAE8};
+        uint32_t origG[9], natG[9], liftG[9];
+        for (int i = 0; i < 9; ++i) origG[i] = M32(gAddr[i]);
+        ParamSnap ps[8]; int nps = 0; FxDirtySnap fxs[32]; int nfxs = 0;
+        if (validGuest(fx) && validGuest(tbl)) {
+            snapAddHandle(fx, M32(tbl + 0x74), 80, ps, &nps, fxs, &nfxs);
+            if (M32(tbl + 0x8BC)) {
+                snapAddHandle(fx, M32(tbl + 0x8E4), 64, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x8BC), 16, ps, &nps, fxs, &nfxs);
+            }
+        }
+        const uint32_t oldN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+        const int handled = fullMaterialSetup(mat, !texNoop);
+        uint32_t natN = validGuest(fx) ? M32(fx + 0x10C) : 0, natDl[64] = {0};
+        if (handled) {
+            for (int i = 0; i < 9; ++i) natG[i] = M32(gAddr[i]);
+            for (int i = 0; i < nps; ++i) memcpy(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len);
+            if (validGuest(fx) && natN > oldN && natN - oldN <= 64) memcpy(natDl, (const void*)ADDR(M32(fx + 0x108) + oldN * 4u), (natN - oldN) * 4u);
+            undoFxDirty(fxs, nfxs);
+            for (int i = 0; i < nps; ++i) memcpy((void*)ADDR(ps[i].ptr), ps[i].orig, ps[i].len);
+            for (int i = 0; i < 9; ++i) M32(gAddr[i]) = origG[i];
+        }
+        { const uint32_t a[1] = {mat}; ccall(sub_005BC940, 1, a); }
+        if (handled) {
+            for (int i = 0; i < 9; ++i) liftG[i] = M32(gAddr[i]);
+            verifySetupGlobalsAndParams(0, fx, texNoop, natG, liftG, 9, ps, nps, oldN, natN, natDl);
+        }
+    }
+    if (t0) { stSetupTicks[0] += setupTicks() - t0; ++stSetupTimingCalls[0]; }
+}
+static void commitChangesCall(uint32_t fx, int canCap) {
+    const int mode = nfs_fx_setup_mode();
+    const uint64_t t0 = setupTimingOn() ? setupTicks() : 0;
+    if (mode == 0 || (mode == 2 && !canCap)) {
+        const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a);
+    } else if (mode == 1) {
+        if (!nfs_fx_commit_changes(fx)) { const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a); }
+    } else {
+        const uint32_t n = validGuest(fx) ? M32(fx + 0x10C) : 0;
+        const uint32_t f118 = validGuest(fx) ? M32(fx + 0x118) : 0;
+        if (!validGuest(fx) || n > 128) {
+            const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a);
+        } else {
+            uint32_t stAddr[128], stDirty[128], stF30[128], natDirty[128], natF30[128];
+            const uint32_t dl = M32(fx + 0x108), passes = M32(fx + 0x2C);
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t passPtr = passes + (uint32_t)M16(dl + i * 4) * 0x64u;
+                const uint32_t st = M32(passPtr + 4) + (uint32_t)M16(dl + i * 4 + 2) * 0x64u;
+                stAddr[i] = st; stDirty[i] = M32(st); stF30[i] = M32(st + 0x30);
+            }
+            const uint16_t origCw = g_fpu_cw;
+            nfsCapBegin();
+            const int handled = nfs_fx_commit_changes(fx);
+            const int nNat = nfsCapEnd();
+            if (!handled) {
+                g_fpu_cw = origCw;
+                const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a);
+            } else {
+                static CapRec natRecs[256];
+                static uint8_t natBytes[65536];
+                const uint32_t natBytesLen = nfsCapBytesSize();
+                const int capOk = nNat >= 0 && nNat <= 256 && natBytesLen <= sizeof natBytes;
+                if (capOk) {
+                    if (nNat) memcpy(natRecs, nfsCapRecs(), sizeof(CapRec) * (size_t)nNat);
+                    if (natBytesLen) memcpy(natBytes, nfsCapBytes(), natBytesLen);
+                }
+                const uint32_t natN = M32(fx + 0x10C), nat118 = M32(fx + 0x118);
+                const uint16_t natCw = g_fpu_cw;
+                for (uint32_t i = 0; i < n; ++i) { natDirty[i] = M32(stAddr[i]); natF30[i] = M32(stAddr[i] + 0x30); }
+                /* restore and run lifted CommitChanges */
+                g_fpu_cw = origCw;
+                M32(fx + 0x10C) = n; M32(fx + 0x118) = f118;
+                for (uint32_t i = 0; i < n; ++i) { M32(stAddr[i]) = stDirty[i]; M32(stAddr[i] + 0x30) = stF30[i]; }
+                nfsCapBegin();
+                { const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a); }
+                const int nLift = nfsCapEnd();
+                ++stSetupVerCalls[5];
+                if (M32(fx + 0x10C) != natN) setupBad(5, "dirtyN", fx, natN, M32(fx + 0x10C));
+                if (M32(fx + 0x118) != nat118) setupBad(5, "f118", fx, nat118, M32(fx + 0x118));
+                if (g_fpu_cw != natCw) setupBad(5, "fpuCw", fx, natCw, g_fpu_cw);
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (M32(stAddr[i]) != natDirty[i]) setupBad(5, "stDirty", stAddr[i], natDirty[i], M32(stAddr[i]));
+                    if (M32(stAddr[i] + 0x30) != natF30[i]) setupBad(5, "stF30", stAddr[i], natF30[i], M32(stAddr[i] + 0x30));
+                }
+                if (capOk && nLift >= 0) {
+                    if (nNat != nLift) setupBad(5, "callCount", fx, (uint32_t)nNat, (uint32_t)nLift);
+                    else {
+                        const CapRec* lr = (const CapRec*)nfsCapRecs();
+                        const uint8_t* lb = nfsCapBytes();
+                        for (int i = 0; i < nNat; ++i) {
+                            if (natRecs[i].method != lr[i].method || natRecs[i].len[0] != lr[i].len[0]) {
+                                setupBad(5, "callMethod", (uint32_t)i, natRecs[i].method, lr[i].method); break;
+                            }
+                            if (natRecs[i].len[0] && memcmp(natBytes + natRecs[i].off[0], lb + lr[i].off[0], natRecs[i].len[0])) {
+                                setupBad(5, "callData", natRecs[i].method, natRecs[i].a[1], lr[i].a[1]); break;
+                            }
+                            if (natRecs[i].method == 94 || natRecs[i].method == 109) {
+                                if (natRecs[i].a[1] != lr[i].a[1] || natRecs[i].a[3] != lr[i].a[3]) {
+                                    setupBad(5, "constReg", natRecs[i].method, natRecs[i].a[1], lr[i].a[1]); break;
+                                }
+                            } else {
+                                const int na = naOf(natRecs[i].method);
+                                const int lim = na > 0 && na <= 4 ? na : 4;
+                                int badArg = 0;
+                                for (int k = 1; k < lim; ++k) {
+                                    if (natRecs[i].a[k] != lr[i].a[k]) {
+                                        setupBad(5, "callArgs", (natRecs[i].method << 8) | (uint32_t)k, natRecs[i].a[k], lr[i].a[k]);
+                                        badArg = 1; break;
+                                    }
+                                }
+                                if (badArg) break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (t0) { stSetupTicks[2] += setupTicks() - t0; ++stSetupTimingCalls[2]; }
+}
+static void paramCalls(uint32_t it) {
+    const int mode = nfs_fx_setup_mode();
+    const uint64_t t0 = setupTimingOn() ? setupTicks() : 0;
+    const uint32_t view = M32(M32(0x870848) + 4);
+    const uint32_t worldMat = M32(it + 0x24);
+    const uint32_t hasV9 = M32(M32(M32(it + 0x18) + 0x1c) + 0x59c);
+    const uint32_t lightCtx = M32(it + 0x1c);
+    const uint32_t matOvr = M32(it + 0x20);
+    if (mode == 0) {
+        { const uint32_t a[2] = {worldMat, view}; ccall(sub_005BDAF0, 2, a); }
+        if (hasV9) {
+            push32(9); push32(RECOMP_RETADDR); sub_0048B1B0(); const uint32_t v9 = g_eax;
+            { const uint32_t a[2] = {worldMat, v9}; ccall(sub_005BD7B0, 2, a); }
+            g_esp += 4;
+        }
+        if (lightCtx) { const uint32_t a[2] = {lightCtx, worldMat}; ccall(sub_005BCE50, 2, a); }
+        if (matOvr) { const uint32_t a[2] = {matOvr, M32(it + 0x14)}; ccall(sub_005BD1B0, 2, a); }
+    } else if (mode == 1) {
+        if (!nativeParamWorldView(worldMat, view)) { const uint32_t a[2] = {worldMat, view}; ccall(sub_005BDAF0, 2, a); }
+        if (hasV9) {
+            const uint32_t v9 = 0x832DE0u + 9u * 0x70u;
+            if (!nativeParamView9(worldMat, v9)) { const uint32_t a[2] = {worldMat, v9}; ccall(sub_005BD7B0, 2, a); }
+        }
+        if (lightCtx && !nativeParamLight(lightCtx, worldMat)) { const uint32_t a[2] = {lightCtx, worldMat}; ccall(sub_005BCE50, 2, a); }
+        if (matOvr && !nativeParamMatOverride(matOvr, M32(it + 0x14))) { const uint32_t a[2] = {matOvr, M32(it + 0x14)}; ccall(sub_005BD1B0, 2, a); }
+    } else {
+        const uint32_t shader = M32(0x870910);
+        const uint32_t fx = validGuest(shader) ? M32(shader + 0x20) : 0;
+        const uint32_t tbl = validGuest(shader) ? M32(shader + 0x1C) : 0;
+        /* 1. sub_005BDAF0 (wv) */
+        {
+            static const uint32_t gAddr[7] = {0x872EF4, 0x872EF8, 0x872EFC, 0x872F00, 0x800534, 0x87684C, 0x876850};
+            uint32_t origG[7], natG[7], liftG[7], natDl[64] = {0};
+            for (int i = 0; i < 7; ++i) origG[i] = M32(gAddr[i]);
+            ParamSnap ps[8]; int nps = 0; FxDirtySnap fxs[32]; int nfxs = 0;
+            if (validGuest(fx) && validGuest(tbl)) {
+                snapAddHandle(fx, M32(tbl + 0x934), 64, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x95C), 64, ps, &nps, fxs, &nfxs);
+            }
+            const uint32_t oldN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            const int handled = nativeParamWorldView(worldMat, view);
+            const uint32_t natN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            if (handled) {
+                for (int i = 0; i < 7; ++i) natG[i] = M32(gAddr[i]);
+                for (int i = 0; i < nps; ++i) memcpy(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len);
+                if (validGuest(fx) && natN > oldN && natN - oldN <= 64) memcpy(natDl, (const void*)ADDR(M32(fx + 0x108) + oldN * 4u), (natN - oldN) * 4u);
+                undoFxDirty(fxs, nfxs);
+                for (int i = 0; i < nps; ++i) memcpy((void*)ADDR(ps[i].ptr), ps[i].orig, ps[i].len);
+                for (int i = 0; i < 7; ++i) M32(gAddr[i]) = origG[i];
+            }
+            { const uint32_t a[2] = {worldMat, view}; ccall(sub_005BDAF0, 2, a); }
+            if (handled) {
+                for (int i = 0; i < 7; ++i) liftG[i] = M32(gAddr[i]);
+                verifySetupGlobalsAndParams(1, fx, 1, natG, liftG, 7, ps, nps, oldN, natN, natDl);
+            }
+        }
+        /* 2. sub_005BD7B0 (v9) */
+        if (hasV9) {
+            const uint32_t v9 = 0x832DE0u + 9u * 0x70u;
+            ParamSnap ps[8]; int nps = 0; FxDirtySnap fxs[32]; int nfxs = 0; uint32_t natDl[64] = {0};
+            if (validGuest(fx) && validGuest(tbl)) {
+                snapAddHandle(fx, M32(tbl + 0x5C4), 64, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x574), 16, ps, &nps, fxs, &nfxs);
+            }
+            const uint32_t oldN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            const int handled = nativeParamView9(worldMat, v9);
+            const uint32_t natN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            if (handled) {
+                for (int i = 0; i < nps; ++i) memcpy(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len);
+                if (validGuest(fx) && natN > oldN && natN - oldN <= 64) memcpy(natDl, (const void*)ADDR(M32(fx + 0x108) + oldN * 4u), (natN - oldN) * 4u);
+                undoFxDirty(fxs, nfxs);
+                for (int i = 0; i < nps; ++i) memcpy((void*)ADDR(ps[i].ptr), ps[i].orig, ps[i].len);
+            }
+            { const uint32_t a[2] = {worldMat, v9}; ccall(sub_005BD7B0, 2, a); }
+            if (handled) verifySetupGlobalsAndParams(2, fx, 1, NULL, NULL, 0, ps, nps, oldN, natN, natDl);
+        }
+        /* 3. sub_005BCE50 (light) */
+        if (lightCtx) {
+            ParamSnap ps[8]; int nps = 0; FxDirtySnap fxs[32]; int nfxs = 0; uint32_t natDl[64] = {0};
+            if (validGuest(fx) && validGuest(tbl)) {
+                snapAddHandle(fx, M32(tbl + 0x4FC), 160, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x5EC), 16, ps, &nps, fxs, &nfxs);
+            }
+            const uint32_t oldN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            const int handled = nativeParamLight(lightCtx, worldMat);
+            const uint32_t natN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            if (handled) {
+                for (int i = 0; i < nps; ++i) memcpy(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len);
+                if (validGuest(fx) && natN > oldN && natN - oldN <= 64) memcpy(natDl, (const void*)ADDR(M32(fx + 0x108) + oldN * 4u), (natN - oldN) * 4u);
+                undoFxDirty(fxs, nfxs);
+                for (int i = 0; i < nps; ++i) memcpy((void*)ADDR(ps[i].ptr), ps[i].orig, ps[i].len);
+            }
+            { const uint32_t a[2] = {lightCtx, worldMat}; ccall(sub_005BCE50, 2, a); }
+            if (handled) verifySetupGlobalsAndParams(3, fx, 1, NULL, NULL, 0, ps, nps, oldN, natN, natDl);
+        }
+        /* 4. sub_005BD1B0 (ovr) */
+        if (matOvr) {
+            ParamSnap ps[8]; int nps = 0; FxDirtySnap fxs[32]; int nfxs = 0; uint32_t natDl[64] = {0};
+            if (validGuest(fx) && validGuest(tbl)) {
+                snapAddHandle(fx, M32(tbl + 0x164), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x18C), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x7CC), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x81C), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x2A4), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x27C), 16, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x7F4), 4, ps, &nps, fxs, &nfxs);
+                snapAddHandle(fx, M32(tbl + 0x2CC), 4, ps, &nps, fxs, &nfxs);
+            }
+            const uint32_t oldN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            const int handled = nativeParamMatOverride(matOvr, M32(it + 0x14));
+            const uint32_t natN = validGuest(fx) ? M32(fx + 0x10C) : 0;
+            if (handled) {
+                for (int i = 0; i < nps; ++i) memcpy(ps[i].nat, (const void*)ADDR(ps[i].ptr), ps[i].len);
+                if (validGuest(fx) && natN > oldN && natN - oldN <= 64) memcpy(natDl, (const void*)ADDR(M32(fx + 0x108) + oldN * 4u), (natN - oldN) * 4u);
+                undoFxDirty(fxs, nfxs);
+                for (int i = 0; i < nps; ++i) memcpy((void*)ADDR(ps[i].ptr), ps[i].orig, ps[i].len);
+            }
+            { const uint32_t a[2] = {matOvr, M32(it + 0x14)}; ccall(sub_005BD1B0, 2, a); }
+            if (handled) verifySetupGlobalsAndParams(4, fx, 1, NULL, NULL, 0, ps, nps, oldN, natN, natDl);
+        }
+    }
+    if (t0) { stSetupTicks[1] += setupTicks() - t0; ++stSetupTimingCalls[1]; }
 }
 /* vertex buffer (created on first use), stream source, indices; 0 = nothing to draw */
 static int bindBuffers(uint32_t it, int fast) {
@@ -436,7 +1033,7 @@ static void nativeItemFull(uint32_t it, RunState* rs, int keepOpen) {
         { const uint32_t a[3] = {dev, 0xE, 0}; devMethod(57, 3, a); }
         M32(0x87092C) = 0;
         const uint32_t npasses = M32(M32(it + 0x18) + 0x14);
-        { const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a); }
+        commitChangesCall(fx, 0);
         for (uint32_t p = 0; (int32_t)p < (int32_t)npasses; ++p) {
             { const uint32_t a[2] = {fx, p}; fxMethod(fx, 66, 2, a); }
             dev = M32(0x870974);
@@ -452,7 +1049,7 @@ static void nativeItemFull(uint32_t it, RunState* rs, int keepOpen) {
     if (M32(it + 0x28) && (M8(it + 0x14) & 1)) { const uint32_t a[2] = {M32(it + 0x28), strip}; ccall(sub_005BD9E0, 2, a); }
     if (!bindBuffers(it, 1)) return;
     const int32_t npasses = itemPasses(it);
-    { const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a); }
+    commitChangesCall(fx, 0);
     for (int32_t p = 0; p < npasses; ++p) {
         { const uint32_t a[2] = {fx, (uint32_t)p}; fxMethod(fx, 66, 2, a); }
         drawItem(it, 1);
@@ -521,7 +1118,7 @@ static void commitRunItem(uint32_t it, RunState* rs) {
     if (rs->open && rs->commit && rs->fx == fx && itemPasses(it) == 1) {
         paramCalls(it);
         if (bindBuffers(it, 1)) {
-            { const uint32_t a[1] = {fx}; fxMethod(fx, 67, 1, a); }
+            commitChangesCall(fx, 1);
             if (g_commitRun == 2) {
                 { const uint32_t a[1] = {fx}; fxMethod(fx, 68, 1, a); }
                 const uint64_t p0 = nfsD3dPushedCount();
@@ -1097,7 +1694,7 @@ static void nativeFlush(void) {
                 if (verify) ++stGroupsVerify;
                 ++stGroupsFull;
                 if (tracing) nfsCapBegin();
-                { const uint32_t a[1] = {mat}; ccall(sub_005BC940, 1, a); }
+                fullMaterialSetupCall(mat);
                 if (tracing) { const int n = nfsCapEnd(); printf("[GROUP] frame %u slot %u g=%08x mat=%08x calls=%d\n", getD3D9PresentCount(), slot, g, mat, n); printCalls(n); }
                 if (rec) {
                     memset(&pend, 0, offsetof(MatRec, calls));
@@ -1134,7 +1731,32 @@ static void nativeFlush(void) {
 }
 static int g_nativeFlush = -1;
 void sub_005CF150(void) {
-    if (drawDist < 0) { const char* e = getenv("NFSU2_DRAW_DIST"); drawDist = e ? (float)atof(e) : 0; }
+    if (drawDist < 0) {
+        const char* e = getenv("NFSU2_DRAW_DIST");
+        drawDist = e ? (float)atof(e) : 0.0f;
+        const char* eb = getenv("NFSU2_DRAW_BUDGET");
+        drawBudget = eb ? atoi(eb) : 0;
+        if (drawBudget < 0) drawBudget = 0;
+        effDist = drawDist > 0.0f ? drawDist : (drawBudget > 0 ? 200.0f : 0.0f);
+    }
+    const uint32_t curFrame = getD3D9PresentCount();
+    if (curFrame != lastBudgetFrame) {
+        if (lastBudgetFrame != 0xffffffffu && drawBudget > 0 && effDist > 0.0f) {
+            const float maxDist = drawDist > 0.0f ? drawDist : 200.0f;
+            const float minDist = 45.0f < maxDist ? 45.0f : maxDist;
+            const uint32_t hi = (uint32_t)((float)drawBudget * 1.10f);
+            const uint32_t lo = (uint32_t)((float)drawBudget * 0.90f);
+            if (frameKept > hi) {
+                effDist *= 0.94f;
+                if (effDist < minDist) effDist = minDist;
+            } else if (frameKept < lo) {
+                effDist *= 1.03f;
+                if (effDist > maxDist) effDist = maxDist;
+            }
+        }
+        frameKept = 0;
+        lastBudgetFrame = curFrame;
+    }
     const uint32_t viewRec = M32(0x870848);
     const uint32_t viewId = validGuest(viewRec) ? M32(viewRec + 4) : 0xffffffffu;
     const uint32_t vm = viewId < 64 ? M32(0x832DE0 + viewId * 0x70) : 0;
@@ -1174,9 +1796,9 @@ void sub_005CF150(void) {
                     ++stItems;
                     const uint32_t mesh = M32(it + 0x10), mat = M32(it + 0x24);
                     const uint32_t solid = validGuest(mesh) ? M32(mesh) : 0;
-                    if (!validGuest(solid) || !validGuest(mat)) { ++stNoBound; continue; }
+                    if (!validGuest(solid) || !validGuest(mat)) { ++stNoBound; ++frameKept; continue; }
                     const Bound* b = solidBound(solid);
-                    if (!b->ok) { ++stNoBound; continue; }
+                    if (!b->ok) { ++stNoBound; ++frameKept; continue; }
                     const float* W = (const float*)ADDR(mat);
                     float c[3], sc = 0;
                     for (int j = 0; j < 3; ++j) c[j] = b->c[0] * W[0 * 4 + j] + b->c[1] * W[1 * 4 + j] + b->c[2] * W[2 * 4 + j] + W[12 + j];
@@ -1187,12 +1809,14 @@ void sub_005CF150(void) {
                     ++stHist[bin];
                     if (bin == 7) { static int shown; if (shown++ < 12) printf("[NFSU2 CULL] far item: slot %u near %.0f centre %.0f radius %.0f scale %.2f identity %d solid %08x verts %u fx %08x view %u\n",
                         s, near, sqrtf(dx * dx + dy * dy + dz * dz), b->r, sqrtf(sc), mat == 0x872E90u, solid, M32(solid + 0x34), M32(M32(it + 0x18) + 0x20), viewId); }
-                    if (drawDist > 0 && near > drawDist && validGuest(itemPool)) {
+                    if (effDist > 0 && near > effDist && validGuest(itemPool)) {
                         /* unlink and give back to the item pool (sub_0043F970) */
                         const uint32_t prev = M32(it + 4);
                         M32(prev) = next; M32(next + 4) = prev;
                         M32(it) = M32(itemPool + 0x10); M32(itemPool + 0x10) = it; M32(itemPool + 0x18) -= 1;
                         ++stCulled;
+                    } else {
+                        ++frameKept;
                     }
                 }
             }
@@ -1202,8 +1826,8 @@ void sub_005CF150(void) {
     if (now != stFrame) {
         stFrame = now;
         if (++stFrames % 240 == 0 && stItems) {
-            printf("[NFSU2 CULL] items/frame %u (no bound %u), nearest surface distance: <100m %u, <150 %u, <200 %u, <250 %u, <300 %u, <400 %u, <600 %u, more %u; culled %u (draw distance %.0f m)\n",
-                   stItems / 240, stNoBound / 240, stHist[0] / 240, stHist[1] / 240, stHist[2] / 240, stHist[3] / 240, stHist[4] / 240, stHist[5] / 240, stHist[6] / 240, stHist[7] / 240, stCulled / 240, drawDist);
+            printf("[NFSU2 CULL] items/frame %u (no bound %u), nearest surface distance: <100m %u, <150 %u, <200 %u, <250 %u, <300 %u, <400 %u, <600 %u, more %u; culled %u (draw distance %.0f m, eff %.0f m, budget %d)\n",
+                   stItems / 240, stNoBound / 240, stHist[0] / 240, stHist[1] / 240, stHist[2] / 240, stHist[3] / 240, stHist[4] / 240, stHist[5] / 240, stHist[6] / 240, stHist[7] / 240, stCulled / 240, drawDist, effDist, drawBudget);
             printf("[NFSU2 CULL] per slot items/groups:");
             for (int k = 0; k < 23; ++k) if (slotItems[k]) printf(" s%d=%u/%u", k, slotItems[k] / 240, slotGroups[k] / 240);
             printf("\n");
@@ -1223,6 +1847,22 @@ void sub_005CF150(void) {
             if (g_commitTime && stCommitItems && stCommitFull) printf("; %.1f us per committed item, %.1f us per full item", stCommitNs / 1000.0 / stCommitItems, stFullNs / 1000.0 / stCommitFull);
             if (g_commitRun == 2) printf("; verified %u, missed device states %u", stCommitChecked, stCommitMissed);
             printf("\n");
+            if (nfs_fx_setup_mode() == 2) {
+                printf("[NFSU2 SETUP] verify: mat %u/%u bad, wv %u/%u, v9 %u/%u, light %u/%u, ovr %u/%u, commit %u/%u\n",
+                       stSetupVerCalls[0], stSetupVerBad[0], stSetupVerCalls[1], stSetupVerBad[1],
+                       stSetupVerCalls[2], stSetupVerBad[2], stSetupVerCalls[3], stSetupVerBad[3],
+                       stSetupVerCalls[4], stSetupVerBad[4], stSetupVerCalls[5], stSetupVerBad[5]);
+            }
+            if (setupTimingOn() && (stSetupTimingCalls[0] || stSetupTimingCalls[1] || stSetupTimingCalls[2])) {
+                uint64_t freq; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+                printf("[NFSU2 SETUP] timing (%s): mat %llu (%.2f us), params %llu (%.2f us), commit %llu (%.2f us)\n",
+                       nfs_fx_setup_mode() == 1 ? "native" : nfs_fx_setup_mode() == 2 ? "verify" : "lifted",
+                       (unsigned long long)stSetupTimingCalls[0], stSetupTimingCalls[0] ? stSetupTicks[0] * 1e6 / freq / stSetupTimingCalls[0] : 0.0,
+                       (unsigned long long)stSetupTimingCalls[1], stSetupTimingCalls[1] ? stSetupTicks[1] * 1e6 / freq / stSetupTimingCalls[1] : 0.0,
+                       (unsigned long long)stSetupTimingCalls[2], stSetupTimingCalls[2] ? stSetupTicks[2] * 1e6 / freq / stSetupTimingCalls[2] : 0.0);
+                memset(stSetupTicks, 0, sizeof stSetupTicks);
+                memset(stSetupTimingCalls, 0, sizeof stSetupTimingCalls);
+            }
             stCommitItems = stCommitFull = stCommitCross = 0; stCommitNs = stFullNs = 0;
             stFlushNative = stFlushLifted = stFlushItems = stFlushFast = stFlushLearn = stFlushVerify = 0;
             memset(slotItems, 0, sizeof slotItems); memset(slotGroups, 0, sizeof slotGroups);

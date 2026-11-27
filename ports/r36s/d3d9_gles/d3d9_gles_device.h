@@ -212,7 +212,7 @@ private:
 
     // instanceLayout: id of the instanced vertex-shader variant to use (0 = the normal one); *instancingUnavailable
     // is set when that variant cannot be made (nothing is drawn then: the caller draws the instances one by one).
-    bool prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout = 0, bool* instancingUnavailable = nullptr);
+    bool prepareDraw(const void* upData, UINT upStride, INT baseVertex, uint32_t instanceLayout = 0, bool* instancingUnavailable = nullptr, GLuint ibo = 0, bool* vaoBoundIbo = nullptr);
 public:
     // One DrawIndexedPrimitive repeated for `instances` objects that differ only in the vertex-shader registers
     // `registers` (count each): data holds instances x count vec4. Leaves the register file as the last instance
@@ -228,14 +228,50 @@ private:
         uint64_t draws = 0, instances = 0;
     } m_instancing;
     void initInstancing();
+    struct VaoAttribKey {
+        uint8_t loc, size, norm, pad;
+        uint16_t type, stride;
+        GLuint vbo;
+        uint32_t offset;
+    };
+    struct VaoKey {
+        uint8_t count, pad0, pad1, pad2;
+        GLuint ibo;
+        VaoAttribKey a[8];
+    };
+    struct VaoEntry {
+        VaoKey key{};
+        GLuint vao = 0;
+        uint16_t enabledMask = 0;
+        bool valid = false;
+    };
+    static constexpr size_t kVaoSets = 128;
+    static constexpr size_t kVaoWays = 4;
+    struct VaoCache {
+        bool initialized = false, available = false;
+        void (*genVertexArrays)(GLsizei, GLuint*) = nullptr;
+        void (*bindVertexArray)(GLuint) = nullptr;
+        void (*deleteVertexArrays)(GLsizei, const GLuint*) = nullptr;
+        GLuint currentVao = 0;
+        VaoEntry entries[kVaoSets * kVaoWays]{};
+        uint8_t setCursor[kVaoSets]{};
+        uint64_t hits = 0, misses = 0, evictions = 0;
+    } m_vao;
+    void initVaoCache();
+    void destroyVaoCache();
+    void bindDefaultVao();
+    void invalidateVaoBuffer(GLuint buf);
+    static IDirect3DDevice9GLES* s_vaoDevice;
+    static void vaoBufferDeleteCallback(GLuint buf);
+    static void vaoEnsureDefaultCallback();
     void bindRenderTarget();
     void createBackBufferTarget(UINT width, UINT height);
     void destroyBackBufferTarget();
     void presentBackBuffer();
     void applyViewportAndScissor();
     void applyRenderStates();
-    void applyTextures(const struct ShaderVariant* psVariant, bool ffpPS, int ffpStages);
-    void applySamplerParams(int stage, IDirect3DBaseTexture9* tex);
+    void applyTextures(const struct ShaderVariant* psVariant, bool ffpPS, int ffpStages, bool is2DUI);
+    void applySamplerParams(int stage, IDirect3DBaseTexture9* tex, bool is2DUI);
     const std::vector<D3DVERTEXELEMENT9>& currentElements();
     void traceDraw(const char* kind, UINT prims);
     void noteUnimplemented(const char* what);

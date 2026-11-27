@@ -1380,9 +1380,10 @@ void setGuestResolution(unsigned width,unsigned height){
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Selected render resolution %ux%u",width,height);
 }
 void setGuestFrameLimit(unsigned framesPerSecond){
-    frameLimit=(framesPerSecond>=30&&framesPerSecond<=240)?framesPerSecond:0;
+    frameLimit=(framesPerSecond>=15&&framesPerSecond<=240)?framesPerSecond:0;
     // The game paces itself to 1/60 s; let it run at the cap (uncapped: the 120 Hz display).
-    nfs_widescreen_set_frame_rate(frameLimit.load()?frameLimit.load():120);
+    // Clamp internal guest frame time table to >= 30 FPS so VP6 video mode init (0x7875BC) stays valid.
+    nfs_widescreen_set_frame_rate(frameLimit.load()?std::max(30u,frameLimit.load()):120);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Android frame limit %u FPS (0 means uncapped)",frameLimit.load());
 }
 void setGuestKey(unsigned scan,bool down){if(scan>=256)return;std::lock_guard<std::mutex> lock(inputMutex);if(bool(inputKeys[scan])==down)return;inputKeys[scan]=down?0x80:0;recordInputKey(scan,down);enqueueGuestKey(scan,down);}

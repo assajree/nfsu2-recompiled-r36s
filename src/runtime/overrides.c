@@ -44,6 +44,15 @@ extern void nfs_fx_param_set(uint32_t handle);
 extern void nfs_fx_global_dirty(void);
 extern int nfs_fx_cache_mode(void);
 extern uint32_t getD3D9PresentCount(void);
+#if defined(NFS_R36S) && !defined(NFS_FX_PRESHADER_ONLY)
+extern int nfs_fx_setup_mode(void);
+extern int nfs_fx_set_matrix(uint32_t fx, uint32_t handle, const float* mat);
+extern int nfs_fx_set_vector(uint32_t fx, uint32_t handle, const float* vec);
+extern int nfs_fx_set_vector_array(uint32_t fx, uint32_t handle, const float* vecs, uint32_t count);
+extern int nfs_fx_set_float(uint32_t fx, uint32_t handle, float val);
+extern int nfs_fx_set_int_array(uint32_t fx, uint32_t handle, const uint32_t* vals, uint32_t count);
+extern int nfs_fx_set_texture_noop(uint32_t fx, uint32_t handle, uint32_t tex);
+#endif
 static __attribute__((unused)) void ov_fx_begin_pass(void) {  /* R36S only (NFSU2_FX_STATS) */
     static uint32_t frame, calls, repeats, lastFx, lastPass, frames;
     static uint32_t fx[64]; static uint32_t nfx;
@@ -144,12 +153,25 @@ static void ov_fx_method(void) {
         cVa[h] = va;
     }
     const int idx = cIdx[h];
+    static int stats = -1; if (stats < 0) { const char* e = getenv("NFSU2_FX_STATS"); stats = e && e[0] == '1'; }
+#if defined(NFS_R36S) && !defined(NFS_FX_PRESHADER_ONLY)
+    if (!stats && nfs_fx_setup_mode() == 1 && idx >= 28 && idx <= 52 && !(idx & 1)) {
+        const uint32_t fx = *(const uint32_t*)ADDR(g_esp + 4);
+        const uint32_t handle = *(const uint32_t*)ADDR(g_esp + 8);
+        const uint32_t a2 = *(const uint32_t*)ADDR(g_esp + 12);
+        if (idx == 38 && a2 >= 0x400000u && a2 < 0x30000000u && nfs_fx_set_matrix(fx, handle, (const float*)ADDR(a2))) { g_eax = 0; g_esp += 16; return; }
+        if (idx == 34 && a2 >= 0x400000u && a2 < 0x30000000u && nfs_fx_set_vector(fx, handle, (const float*)ADDR(a2))) { g_eax = 0; g_esp += 16; return; }
+        if (idx == 36 && a2 >= 0x400000u && a2 < 0x30000000u && nfs_fx_set_vector_array(fx, handle, (const float*)ADDR(a2), *(const uint32_t*)ADDR(g_esp + 16))) { g_eax = 0; g_esp += 20; return; }
+        if (idx == 30) { float fv; memcpy(&fv, &a2, 4); if (nfs_fx_set_float(fx, handle, fv)) { g_eax = 0; g_esp += 16; return; } }
+        if (idx == 28 && a2 >= 0x400000u && a2 < 0x30000000u && nfs_fx_set_int_array(fx, handle, (const uint32_t*)ADDR(a2), *(const uint32_t*)ADDR(g_esp + 16))) { g_eax = 0; g_esp += 20; return; }
+        if (idx == 52 && nfs_fx_set_texture_noop(fx, handle, a2)) { g_eax = 0; g_esp += 16; return; }
+    }
+#endif
     if (idx >= 0) {
         ++fxMethodCalls[idx];
         if (!(idx & 1) && idx <= 56) nfs_fx_param_set(*(const uint32_t*)ADDR(g_esp + 8));  /* Set*(this, handle, ...) */
         else if (idx >= 56) nfs_fx_global_dirty();
     }
-    static int stats = -1; if (stats < 0) { const char* e = getenv("NFSU2_FX_STATS"); stats = e && e[0] == '1'; }
     if (stats) {
         const uint32_t now = getD3D9PresentCount();
         if (now != fxFrame) {
@@ -190,6 +212,13 @@ static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
 extern int nfs_fx_lazy_enabled(void);
 extern void nfs_fx_lazy_begin(void); extern void nfs_fx_lazy_begin_pass(void); extern void nfs_fx_lazy_commit(void);
 extern void nfs_fx_lazy_end_pass(void); extern void nfs_fx_lazy_end(void);
+#if NFS_EXE_VARIANT == NFS_EXE_V10
+extern int nfs_distant_ai_rate(void);
+extern void nfs_ov_physics_update(void);
+extern void nfs_ov_ai_drag(void);
+extern void nfs_ov_ai_race(void);
+extern void nfs_ov_ai_traffic(void);
+#endif
 #endif
 enum { OV_SLOTS = 256 };
 static uint32_t ovKey[OV_SLOTS]; static nfs_override_fn ovFn[OV_SLOTS];
@@ -214,6 +243,14 @@ static void ov_build(void) {
         ov_put(NFS_VA(0x006644A6), nfs_fx_lazy_begin); ov_put(NFS_VA(0x0066A9F6), nfs_fx_lazy_begin_pass);
         ov_put(NFS_VA(0x0066A93B), nfs_fx_lazy_commit); ov_put(NFS_VA(0x0065AAEC), nfs_fx_lazy_end_pass); ov_put(NFS_VA(0x0065AA06), nfs_fx_lazy_end);
     }
+#if NFS_EXE_VARIANT == NFS_EXE_V10
+    if (nfs_distant_ai_rate() >= 2) {
+        ov_put(0x005B6FF0u, nfs_ov_physics_update);
+        ov_put(0x0042DF50u, nfs_ov_ai_drag);
+        ov_put(0x0042C100u, nfs_ov_ai_race);
+        ov_put(0x00429DD0u, nfs_ov_ai_traffic);
+    }
+#endif
 #else
     /* Android: the effect Set* hooks feed the preshader cache (fx_cache.c, NFS_FX_PRESHADER_ONLY). */
 #if defined(NFS_FX_PRESHADER_ONLY)

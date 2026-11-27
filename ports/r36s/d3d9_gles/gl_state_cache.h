@@ -171,18 +171,37 @@ inline void DeleteTextures(GLsizei n, const GLuint* t) {
     }
     (glDeleteTextures)(n, t);
 }
+inline void (*&vaoEnsureDefaultHook())() {
+    static void (*fn)() = nullptr;
+    return fn;
+}
 inline void BindBuffer(GLenum target, GLuint b) {
     GLSC_REQ(); State& s = S();
     if (target == GL_ARRAY_BUFFER) { if (s.arrayValid && s.arrayBuffer == b) return; s.arrayBuffer = b; s.arrayValid = true; }
-    else if (target == GL_ELEMENT_ARRAY_BUFFER) { if (s.elementValid && s.elementBuffer == b) return; s.elementBuffer = b; s.elementValid = true; }
+    else if (target == GL_ELEMENT_ARRAY_BUFFER) {
+        if (auto hook = vaoEnsureDefaultHook()) hook();
+        if (s.elementValid && s.elementBuffer == b) return;
+        s.elementBuffer = b; s.elementValid = true;
+    }
     GLSC_ISSUE(); (glBindBuffer)(target, b);
+}
+inline void (*&vaoDeleteBufferHook())(GLuint) {
+    static void (*fn)(GLuint) = nullptr;
+    return fn;
+}
+inline void onVaoSwitchedToDefault() {
+    State& s = S();
+    s.elementValid = false;
+    for (int i = 0; i < 16; ++i) { s.attribEnabled[i] = -1; s.attrib[i].valid = false; }
 }
 inline void DeleteBuffers(GLsizei n, const GLuint* b) {
     State& s = S();
+    auto hook = vaoDeleteBufferHook();
     for (GLsizei i = 0; i < n; ++i) {
         if (s.arrayBuffer == b[i]) s.arrayValid = false;
         if (s.elementBuffer == b[i]) s.elementValid = false;
         for (auto& a : s.attrib) if (a.buffer == b[i]) a.valid = false;
+        if (hook && b[i]) hook(b[i]);
     }
     (glDeleteBuffers)(n, b);
 }

@@ -24,6 +24,7 @@ struct GLESCaps {
     bool elementIndexUint = false; // GL_OES_element_index_uint
     bool blendMinMax = false;      // GL_EXT_blend_minmax
     bool halfFloatVertex = false;  // GL_OES_vertex_half_float
+    bool es3 = false;              // OpenGL ES 3.0+ (GL_TEXTURE_BASE_LEVEL)
 };
 inline GLESCaps& glesCaps() { static GLESCaps c; return c; }
 
@@ -94,7 +95,7 @@ inline void convertRowToRGBA8(D3DFORMAT f, const uint8_t* src, uint8_t* dst, UIN
 }
 
 struct SamplerParamCache {
-    GLint wrapS = -1, wrapT = -1, minF = -1, magF = -1;
+    GLint wrapS = -1, wrapT = -1, minF = -1, magF = -1, baseLevel = 0;
 };
 
 // Memory accounting for the [NFSU2 PERF] report (the R36S has 1 GB of RAM for everything).
