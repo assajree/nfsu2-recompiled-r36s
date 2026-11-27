@@ -184,7 +184,7 @@ NFSU2_DRAW_DIST=200
 NFSU2_LANG=Spanish
 [ -f "$GAMEDIR/nfsu2.cfg" ] && . "$GAMEDIR/nfsu2.cfg"
 export NFSU2_DRAW_DIST NFSU2_LANG
-for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS; do
+for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS NFSU2_SUBTITLES; do
   eval "[ -n \"\${$v:-}\" ] && export $v"
 done
 # HUD layout table of ThirteenAG's widescreen fix (MIT, see widescreen/LICENSE), used on wide screens

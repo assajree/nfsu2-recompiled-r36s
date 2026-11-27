@@ -54,7 +54,11 @@ WRAP_V10="sub_00664743 sub_00668FAA sub_006689E4 sub_00668EC5 sub_005361B0 sub_0
  sub_0043CA30 sub_00440EA0 sub_0043C310 sub_0043C3B0 sub_0043BE50 sub_00576170 sub_005D6700 sub_005D62C0 sub_005BBF20
  sub_005BC010"
 WRAP="$(python3 "$ROOT/scripts/exe_variant.py" names $WRAP_V10)" || { echo "ERROR: exe_variant.py names failed"; exit 1; }
-echo "lifted from SPEED2.EXE $(python3 "$ROOT/scripts/exe_variant.py" current)"
+CUR_EXE="$(python3 "$ROOT/scripts/exe_variant.py" current)"
+if [ "$CUR_EXE" = "v10" ]; then
+  WRAP="$WRAP sub_0050CEF0 sub_005535F0"
+fi
+echo "lifted from SPEED2.EXE $CUR_EXE"
 # Which source defines each wrapped function (rebuilt when the lifted code changes); each must be defined once.
 WRAPMAP="$GUEST_OUT/.wrap-map"
 if [ ! -f "$WRAPMAP" ] || [ -n "$(find "$ROOT/src/recomp/gen" "$SPLIT" -name 'recomp_*.c' -newer "$WRAPMAP" 2>/dev/null | head -1)" ]; then
