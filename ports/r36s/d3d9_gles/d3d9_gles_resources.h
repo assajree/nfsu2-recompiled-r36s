@@ -6,6 +6,10 @@
 #include <iterator>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 // Set by the D3D9 bridge (android/.../d3d9_render_thread.inc) while it creates a vertex/index buffer on the
 // game thread: the GL buffer is then created on first use on the render thread (ensureGL).
 extern thread_local bool g_glesDeferBufferGL;
@@ -44,9 +48,31 @@ inline UINT d3dFormatBytesPerPixel(D3DFORMAT f) {
 inline void convertRowToRGBA8(D3DFORMAT f, const uint8_t* src, uint8_t* dst, UINT width) {
     switch (static_cast<DWORD>(f)) {
         case D3DFMT_A8R8G8B8:
+#if defined(__aarch64__)
+            for (; width >= 16; width -= 16, src += 64, dst += 64) {
+                uint8x16x4_t px = vld4q_u8(src);
+                uint8x16_t tmp = px.val[0];
+                px.val[0] = px.val[2];
+                px.val[2] = tmp;
+                vst4q_u8(dst, px);
+            }
+#endif
             for (UINT x = 0; x < width; ++x, src += 4, dst += 4) { dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = src[3]; }
             break;
         case D3DFMT_X8R8G8B8:
+#if defined(__aarch64__)
+            {
+                const uint8x16_t alpha_ff = vdupq_n_u8(0xFF);
+                for (; width >= 16; width -= 16, src += 64, dst += 64) {
+                    uint8x16x4_t px = vld4q_u8(src);
+                    uint8x16_t tmp = px.val[0];
+                    px.val[0] = px.val[2];
+                    px.val[2] = tmp;
+                    px.val[3] = alpha_ff;
+                    vst4q_u8(dst, px);
+                }
+            }
+#endif
             for (UINT x = 0; x < width; ++x, src += 4, dst += 4) { dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = 0xFF; }
             break;
         case D3DFMT_X8B8G8R8:
@@ -115,6 +141,8 @@ struct GLTextureObject {
     UINT glLevels = 1;  // levels allocated in GL (full chain when mipmapped)
     bool pot = true;
     bool renderTarget = false;
+    DWORD usage = 0;
+    D3DPOOL pool = D3DPOOL_DEFAULT;
     uint32_t facesUploaded = 0;
     SamplerParamCache cache;
     // Storage format. Textures the bridge decoded from DXT (A8B8G8R8) whose first upload is fully opaque are
@@ -255,8 +283,8 @@ public:
         if (!pDesc) return D3DERR_INVALIDCALL;
         pDesc->Format = m_format;
         pDesc->Type = D3DRTYPE_SURFACE;
-        pDesc->Usage = (m_owner && m_owner->renderTarget) ? D3DUSAGE_RENDERTARGET : 0;
-        pDesc->Pool = D3DPOOL_DEFAULT;
+        pDesc->Usage = m_owner ? m_owner->usage : 0;
+        pDesc->Pool = m_owner ? m_owner->pool : D3DPOOL_DEFAULT;
         pDesc->MultiSampleType = D3DMULTISAMPLE_NONE;
         pDesc->MultiSampleQuality = 0;
         pDesc->Width = m_width;
@@ -317,7 +345,7 @@ public:
                 { glsc::DriverCpuTimer timer; glTexSubImage2D(m_target, m_level, 0, 0, m_width, m_height, GL_RGBA, GL_UNSIGNED_BYTE, m_upload.data()); }
             }
             if (m_owner) m_owner->onUpload(m_level, m_target);
-            std::vector<uint8_t>().swap(m_upload);
+            if (!m_keepShadow) { std::vector<uint8_t>().swap(m_upload); }
             m_uploaded = true;
         }
         if (!m_keepShadow && m_uploaded) {
@@ -394,7 +422,7 @@ private:
 // -----------------------------------------------------------------------------
 class IDirect3DTexture9GLES : public D3D9ComObject<IDirect3DTexture9> {
 public:
-    IDirect3DTexture9GLES(UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format)
+    IDirect3DTexture9GLES(UINT width, UINT height, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool = D3DPOOL_DEFAULT)
         : m_width(width), m_height(height), m_format(format) {
         const UINT full = fullMipCount(width, height);
         UINT numLevels = (levels == 0 || levels > full) ? full : levels;
@@ -403,6 +431,8 @@ public:
         m_obj.d3dLevels = (usage & D3DUSAGE_AUTOGENMIPMAP) ? 1 : numLevels;  // autogen: D3D exposes 1 level
         m_obj.pot = ((width & (width - 1)) == 0) && ((height & (height - 1)) == 0);
         m_obj.renderTarget = (usage & D3DUSAGE_RENDERTARGET) != 0;
+        m_obj.usage = usage;
+        m_obj.pool = pool;
         // Allocate the complete GL chain whenever mipmaps are in use so the texture is always complete.
         const UINT glLevels = m_obj.mipmapped() ? full : 1;
         m_obj.glLevels = glLevels;

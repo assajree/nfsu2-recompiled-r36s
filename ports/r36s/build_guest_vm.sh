@@ -52,7 +52,7 @@ done
 WRAP_V10="sub_00664743 sub_00668FAA sub_006689E4 sub_00668EC5 sub_005361B0 sub_005CF150 sub_005D3080 sub_005BF2E0
  sub_005C5600 sub_005CE860 sub_0075BC00 sub_00401310 sub_00401430 sub_00689A17 sub_00440FF0 sub_0043CA20 sub_0043D250
  sub_0043CA30 sub_00440EA0 sub_0043C310 sub_0043C3B0 sub_0043BE50 sub_00576170 sub_005D6700 sub_005D62C0 sub_005BBF20
- sub_005BC010"
+ sub_005BC010 sub_006FFAA7 sub_0070CCE8"
 WRAP="$(python3 "$ROOT/scripts/exe_variant.py" names $WRAP_V10)" || { echo "ERROR: exe_variant.py names failed"; exit 1; }
 echo "lifted from SPEED2.EXE $(python3 "$ROOT/scripts/exe_variant.py" current)"
 # Which source defines each wrapped function (rebuilt when the lifted code changes); each must be defined once.
