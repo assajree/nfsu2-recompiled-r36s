@@ -182,6 +182,9 @@ echo 0 | sudo tee /sys/class/vtconsole/vtcon1/bind > /dev/null 2>&1 || true
 #   NFSU2_SCREEN=854x480        # only if the panel size is detected wrongly
 #   NFSU2_ROTATE=90             # panel mounted rotated (90 or 270; portrait panels default to 90)
 #   NFSU2_SHOW_FPS=1            # frame counter on from the start (Select + R3 toggles it in game)
+#   NFSU2_SKIP_INTRO=1          # fast boot: skip intro videos (EA/THX/Opening/PSA) without deleting files
+#   NFSU2_ATTRACT_MODE=auto     # auto: disable 30s Title Attract Mode if FMVOpening.vp6 is missing/skipped
+#                               # 0: always disable (keep Title music playing past 30s); 1: original behavior
 # ---------------------------------------------------------------------------
 NFSU2_GRAPHICS=balanced
 NFSU2_POTATO=""
@@ -225,7 +228,7 @@ esac
 [ -z "$NFSU2_DISTANT_AI_RATE" ] && NFSU2_DISTANT_AI_RATE=0
 [ -z "$NFSU2_DISTANT_AI_DIST" ] && NFSU2_DISTANT_AI_DIST=45
 export NFSU2_POTATO NFSU2_DRAW_DIST NFSU2_DRAW_BUDGET NFSU2_LANG NFSU2_HALF_REFLECT NFSU2_DISTANT_AI_RATE NFSU2_DISTANT_AI_DIST
-for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS NFSU2_CROWD NFSU2_PARTICLES NFSU2_SUBTITLES; do
+for v in NFSU2_ASPECT NFSU2_RENDER_SCALE NFSU2_RENDER NFSU2_SCREEN NFSU2_ROTATE NFSU2_SHOW_FPS NFSU2_CROWD NFSU2_PARTICLES NFSU2_SUBTITLES NFSU2_SKIP_INTRO NFSU2_ATTRACT_MODE; do
   eval "[ -n \"\${$v:-}\" ] && export $v"
 done
 # HUD layout table of ThirteenAG's widescreen fix (MIT, see widescreen/LICENSE), used on wide screens

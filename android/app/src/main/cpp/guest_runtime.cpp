@@ -1253,6 +1253,11 @@ std::string connectGuestRuntime(const char* executable) {
         configureD3D9Bridge(memory->base(),allocate,freeD3DGuest);
 #endif
         loadImage(executable);
+        {
+            std::error_code fmvErr;
+            const bool hasOpeningFmv = std::filesystem::exists(gamePath("MOVIES/FMVOpening.vp6"), fmvErr);
+            nfs_intro_init(hasOpeningFmv ? 1 : 0);
+        }
         if(guestWidescreen){
             nfs_widescreen_init(hostGameRoot.c_str());
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen: %d HUD offsets loaded",nfs_widescreen_hud_entries());

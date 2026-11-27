@@ -37,6 +37,14 @@ bool discCheckSwitch(const std::filesystem::path& path){
     return lower(path.filename().string())=="foobar"&&!std::filesystem::exists(path,error)&&
         std::filesystem::weakly_canonical(path.parent_path())==std::filesystem::weakly_canonical(hostGameRoot);
 }
+bool skipIntroMovie(const std::filesystem::path& path){
+    if(!nfs_skip_intro_enabled())return false;
+    std::error_code error;
+    auto parent=path.parent_path();
+    if(lower(parent.filename().string())!="movies")return false;
+    if(std::filesystem::weakly_canonical(parent.parent_path(),error)!=std::filesystem::weakly_canonical(hostGameRoot,error))return false;
+    return nfs_should_skip_intro_movie(path.filename().string().c_str())!=0;
+}
 bool closeGuestFile(uint32_t handle){auto file=fileHandles.find(handle);if(file==fileHandles.end())return false;::close(file->second);fileHandles.erase(file);return true;}
 void fileType(){
     uint32_t handle=arg(0);
@@ -45,7 +53,7 @@ void fileType(){
     lastError=6;ret(0,1);
 }
 void longPath(){
-    auto path=gamePath(guestString(arg(0)));std::error_code error;if(!std::filesystem::exists(path,error)){lastError=2;ret(0,3);return;}
+    auto path=gamePath(guestString(arg(0)));std::error_code error;if(skipIntroMovie(path)||!std::filesystem::exists(path,error)){lastError=2;ret(0,3);return;}
     auto relative=path.lexically_relative(std::filesystem::weakly_canonical(hostGameRoot)).string();
     std::string result="C:\\nfsu2";if(relative!="."&&!relative.empty())result+="\\"+relative;std::replace(result.begin(),result.end(),'/','\\');
     if(arg(2)<=result.size()){ret(result.size()+1,3);return;}std::memcpy(ptr(arg(1),result.size()+1),result.c_str(),result.size()+1);ret(result.size(),3);
@@ -53,6 +61,10 @@ void longPath(){
 void createFile(){
     auto path=gamePath(guestString(arg(0)));uint32_t access=arg(1),disposition=arg(4),flags=arg(5);
     if(flags&0x40000000u)throw GuestStop("Overlapped CreateFile requires asynchronous file service");
+    if(disposition==3&&!(access&0x40000000u)&&skipIntroMovie(path)){
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","[NFSU2 INTRO] skipped %s",path.filename().string().c_str());
+        lastError=2;ret(UINT32_MAX,7);return;
+    }
     int options=access&0x40000000u?(access&0x80000000u?O_RDWR:O_WRONLY):O_RDONLY;
     switch(disposition){case 1:options|=O_CREAT|O_EXCL;break;case 2:options|=O_CREAT|O_TRUNC;break;case 3:break;case 4:options|=O_CREAT;break;case 5:options|=O_TRUNC;break;default:lastError=87;ret(UINT32_MAX,7);return;}
     bool existed=std::filesystem::exists(path);
@@ -83,7 +95,7 @@ void setEndOfFile(){auto file=fileHandles.find(arg(0));if(file==fileHandles.end(
     auto position=::lseek(file->second,0,SEEK_CUR);if(position<0||::ftruncate(file->second,position)){lastError=fileError();ret(0,1);return;}ret(1,1);
 }
 void fileSize(){auto file=fileHandles.find(arg(0));struct stat status{};if(file==fileHandles.end()){lastError=6;ret(UINT32_MAX,2);return;}if(fstat(file->second,&status)){lastError=fileError();ret(UINT32_MAX,2);return;}uint64_t size=status.st_size;if(arg(1))write32(arg(1),size>>32);lastError=0;ret(size,2);}
-void fileAttributes(){auto path=gamePath(guestString(arg(0)));struct stat status{};if(discCheckSwitch(path)){ret(0x20,1);return;}if(stat(path.c_str(),&status)){lastError=fileError();ret(UINT32_MAX,1);return;}ret(S_ISDIR(status.st_mode)?0x10:0x20,1);}
+void fileAttributes(){auto path=gamePath(guestString(arg(0)));struct stat status{};if(skipIntroMovie(path)){lastError=2;ret(UINT32_MAX,1);return;}if(discCheckSwitch(path)){ret(0x20,1);return;}if(stat(path.c_str(),&status)){lastError=fileError();ret(UINT32_MAX,1);return;}ret(S_ISDIR(status.st_mode)?0x10:0x20,1);}
 void setFilePointer(){
     auto file=fileHandles.find(arg(0));if(file==fileHandles.end()){lastError=6;ret(UINT32_MAX,4);return;}
     uint32_t method=arg(3),high=arg(2);if(method>2){lastError=87;ret(UINT32_MAX,4);return;}
@@ -136,6 +148,7 @@ void findFirstFile(){
     if(std::filesystem::is_directory(directory,error))for(const char* dot:{".",".."})if(filePatternMatches(pattern,dot))search.paths.push_back(directory/dot);
     for(auto& entry:std::filesystem::directory_iterator(directory,error)){
         if(!filePatternMatches(pattern,entry.path().filename().string()))continue;
+        if(skipIntroMovie(entry.path()))continue;
         // Apply the same containment check used for ordinary file opens.
         auto logical="C:/nfsu2/"+entry.path().lexically_relative(std::filesystem::weakly_canonical(hostGameRoot)).string();
         gamePath(logical);search.paths.push_back(entry.path());
