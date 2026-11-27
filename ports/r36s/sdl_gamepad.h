@@ -12,7 +12,7 @@
 //   R1 nitrous, L1 look back, R2/L2 shift up/down (manual gearbox), Start pause, Select reset car,
 //   left stick steer. D-pad as on the consoles: Up engage event / enter shop (Enter), Down career status (1),
 //   Left world map (M), Right SMS (Tab).
-// Menus: d-pad / left stick move, Cross or Start accept, Circle or Triangle back, Square = Space.
+// Menus: d-pad / left stick move, Cross or Start accept, Circle back, Triangle = Engage GPS (C), Square = Space.
 #include <SDL.h>
 #include <array>
 #include <cmath>
@@ -117,9 +117,10 @@ private:
         } else {
             want[0xcb] = buttons_[Left] || past(-stickX_, 0xcb); want[0xcd] = buttons_[Right] || past(stickX_, 0xcd);
             want[0xc8] = buttons_[Up] || past(-stickY_, 0xc8); want[0xd0] = buttons_[Down] || past(stickY_, 0xd0);
-            want[0x1c] = buttons_[A] || buttons_[Start];
-            want[0x01] = buttons_[B] || buttons_[Y];
-            want[0x39] = buttons_[X];
+            want[0x1c] = buttons_[A] || buttons_[Start]; // Cross / Start = Accept (Enter)
+            want[0x01] = buttons_[B];                    // Circle = Back / Cancel (Escape)
+            want[0x2e] = buttons_[Y];                    // Triangle = Engage GPS on World Map (DIK_C = 46)
+            want[0x39] = buttons_[X];                    // Square = Space (DIK_SPACE = 57)
         }
         driving_ = driving;
         for (unsigned scan = 0; scan < 256; ++scan)
