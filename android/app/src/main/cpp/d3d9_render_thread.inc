@@ -465,7 +465,6 @@ bool textureLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
         const uint32_t out=args[2],rect=args[3],flags=args[4];
         Object* o=cachedObject(args[0]);if(!o||o->kind!=Kind::Texture||!out||level>=16)return false;
         const bool fresh=texTouched.insert(key).second;
-        (void)fresh;
         if(off||rect||(flags&D3DLOCK_READONLY)||texLocks.count(key))return false;
         TexLock L;CompressedTexture* ct=o->compressed.texture.get();
         if(ct){if(level>=ct->levels||ct->faces!=1)return false;L.pitch=ct->pitch(level);L.rows=(ct->mipHeight(level)+3)/4;L.rowBytes=L.pitch;}
@@ -476,7 +475,7 @@ bool textureLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
             L.rows=blockCompressed(d.Format)?(d.Height+3)/4:d.Height;L.pitch=(L.rowBytes+3)&~3u;
         }
         L.size=L.pitch*L.rows;if(!L.size||L.size>(8u<<20))return false;
-        L.guest=allocateGuest(L.size);if(!L.guest)return false;std::memset(pointer(L.guest),0,L.size);
+        L.guest=allocateGuest(L.size);if(!L.guest)return false;if(fresh)std::memset(pointer(L.guest),0,L.size);
         texLocks[key]=L;write(out,L.pitch);write(out+4,L.guest);*count=5;*result=D3D_OK;return true;
     }
     auto it=texLocks.find(key);if(it==texLocks.end())return false;
