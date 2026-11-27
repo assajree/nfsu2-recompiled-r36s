@@ -730,6 +730,24 @@ void loadImage(const char* path) {
         if (uint64_t(sec.PointerToRawData)+sec.SizeOfRawData>file.size()) throw GuestStop("Truncated PE section");
         std::memcpy(ptr(imageBase+sec.VirtualAddress,sec.SizeOfRawData),file.data()+sec.PointerToRawData,sec.SizeOfRawData);
     }
+#if NFS_EXE_VARIANT == NFS_EXE_V10
+    // Retail US v1.0 SPEED2.EXE only has 11 language descriptor slots (0x00..0x0A, English..Japanese),
+    // even though its registry table already maps "Thai" to language ID 0x0B. When Thai is selected,
+    // repurpose slot 10 (Japanese) in guest memory so Thailand.bin and its HD font textures stream
+    // natively without modifying SPEED2.EXE on disk.
+    if (guestLanguage == "Thai") {
+        static constexpr char kThaiBin[] = "LANGUAGES\\THAILAND.BIN";
+        static constexpr char kThaiTag[] = "THAILAND";
+        std::memcpy(ptr(0x0079A6E8u, sizeof(kThaiBin)), kThaiBin, sizeof(kThaiBin));
+        std::memcpy(ptr(0x0079A700u, sizeof(kThaiTag)), kThaiTag, sizeof(kThaiTag));
+        write32(0x007F6F40u, 0x4815619Du); // CONDUITMDITC_TT21I_THAILAND font texture hash
+        write32(0x007F6F48u, 0xA73823FFu); // CONDUITMDITC_TT14I_THAILAND font texture hash
+        write32(0x007F70C0u, 0x0000000Bu); // Language descriptor slot 10 ID -> Thai (0x0B)
+        write32(0x007F7108u, 0x0000000Bu); // Logo table slot 10 ID -> Thai (0x0B)
+        write32(0x007FCA00u, 0x0000000Bu); // Default fallback language ID -> Thai (0x0B)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO, "NFSU2", "Applied in-memory Thai localization table for v10");
+    }
+#endif
     entry=imageBase+opt.AddressOfEntryPoint;
     if (entry == 0x0075bcc7u && !recomp_lookup(0x0075bcc7u) && recomp_lookup(0x0075b9f1u)) {
         NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Remapping entry point 0x0075bcc7 -> 0x0075b9f1 (WinMainCRTStartup)");
@@ -1401,6 +1419,11 @@ void setGuestLanguage(const char* language){
     if(language){
         if(std::strcmp(language,"English")==0||std::strcmp(language,"english")==0||std::strcmp(language,"en")==0||std::strcmp(language,"English UK")==0||std::strcmp(language,"English US")==0){
             guestLanguage="English UK";
+            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Selected guest language: %s",guestLanguage.c_str());
+            return;
+        }
+        if(std::strcmp(language,"Thai")==0||std::strcmp(language,"thai")==0||std::strcmp(language,"th")==0){
+            guestLanguage="Thai";
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Selected guest language: %s",guestLanguage.c_str());
             return;
         }

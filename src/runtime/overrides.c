@@ -9,6 +9,8 @@
  * slot, arguments are at g_esp+4.., the body leaves its result in g_eax and
  * pops what `ret N` would (g_esp += 4 + N).
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -16,6 +18,81 @@
 #include "recomp_types.h"
 #include "nfs_runtime.h"
 #include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
+
+#if defined(NFS_R36S) && (NFS_EXE_VARIANT == NFS_EXE_V10)
+/* Subtitle control (R36S v10):
+ *   NFSU2_SUBTITLES=1          -> force subtitles ON for all languages (cutscenes + in-game movies)
+ *   NFSU2_SUBTITLES=0          -> force subtitles OFF for all languages
+ *   NFSU2_SUBTITLES unset/auto -> ON automatically when guest language is Thai (0x0B), original
+ *                                 game behavior otherwise. */
+extern void sub_0050CEF0_orig(void);
+extern void sub_005535F0_orig(void);
+extern void sub_0057D730(void);
+
+static int nfs_subtitle_mode(void) {
+    static int env_mode = -2;
+    if (env_mode == -2) {
+        const char* e = getenv("NFSU2_SUBTITLES");
+        if (e && e[0] == '0') env_mode = 0;
+        else if (e && e[0] == '1') env_mode = 1;
+        else env_mode = -1;
+        fprintf(stderr, "[NFSU2 SUB] config NFSU2_SUBTITLES=%s (mode=%s, lang=0x%x)\n",
+                (e && e[0]) ? e : "<unset>",
+                env_mode == 1 ? "force-on" : (env_mode == 0 ? "force-off" : "auto-thai"),
+                MEM32(0x007FCA00u));
+    }
+    if (env_mode >= 0) return env_mode;
+    return (MEM32(0x007FCA00u) == 0x0Bu) ? 1 : -1;
+}
+
+/* 0x0050CEF0 (v10): IsSubtitlesEnabled() — gates PSA/Intro (0x004A8A16) and Story Comics (0x0055ACC7). */
+void sub_0050CEF0(void) {
+    const int mode = nfs_subtitle_mode();
+    if (mode >= 0) {
+        g_eax = (g_eax & ~0xFFu) | (uint32_t)(mode ? 1u : 0u);
+        g_esp += 4u;
+        return;
+    }
+    sub_0050CEF0_orig();
+}
+
+/* 0x005535F0 (v10): IG_PlayMovie screen constructor — gates in-game movie subtitles (0x00553720). */
+void sub_005535F0(void) {
+    const int mode = nfs_subtitle_mode();
+    if (mode < 0) {
+        sub_005535F0_orig();
+        return;
+    }
+    const uint32_t lang = MEM32(0x00864F24u);
+    const uint32_t flag = MEM32(0x007F70D0u);
+    const int orig_enabled = (lang == 4u) || (lang == 12u) || ((lang == 2u || lang == 5u) && flag != 0u);
+    if (mode == 0) {
+        if (orig_enabled) {
+            MEM32(0x00864F24u) = 0u;
+            sub_005535F0_orig();
+            MEM32(0x00864F24u) = lang;
+        } else {
+            sub_005535F0_orig();
+        }
+        return;
+    }
+    /* mode == 1: run original constructor, then invoke sub_0057D730 if the original language check skipped it. */
+    sub_005535F0_orig();
+    if (!orig_enabled) {
+        const uint32_t saved_eax = g_eax, saved_ecx = g_ecx, saved_edx = g_edx;
+        const uint32_t saved_ebx = g_ebx, saved_esi = g_esi, saved_edi = g_edi, saved_ebp = g_ebp;
+        const uint32_t this_ptr = saved_eax;
+        const uint32_t movie_name = (MEM32(0x0083856Cu) << 6u) + 0x008382A0u;
+        g_esp -= 4u; MEM32(g_esp) = 0x00799EECu; /* "IG_PlayMovie.fng" */
+        g_esp -= 4u; MEM32(g_esp) = movie_name;
+        g_esp -= 4u; MEM32(g_esp) = 0u;          /* dummy return address (popped by ret 8) */
+        g_ecx = this_ptr + 0x54u;
+        sub_0057D730();
+        g_eax = saved_eax; g_ecx = saved_ecx; g_edx = saved_edx;
+        g_ebx = saved_ebx; g_esi = saved_esi; g_edi = saved_edi; g_ebp = saved_ebp;
+    }
+}
+#endif
 
 /* VA of the indirect call in flight. The guest CPU state is one struct (g_cpu) when a build defines
  * RECOMP_TLS_STRUCT, otherwise separate thread-local variables; guest_runtime.cpp defines both. */
