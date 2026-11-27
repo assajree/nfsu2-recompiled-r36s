@@ -10,6 +10,9 @@
  * pops what `ret N` would (g_esp += 4 + N).
  */
 #include <string.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include "recomp_types.h"
 #include "nfs_runtime.h"
 #include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
@@ -174,12 +177,88 @@ static void ov_crt_memmove(void) {
     g_esp += 4;
 }
 
+/* 0x0070CCE8 (v12 0x0070CF98): VP6 CPU feature detection (cdecl: int *has_mmx, int *has_xmm, int *has_wmt).
+ * The lifted MMX/SSE2 paths emulate 64/128-bit SIMD through stack V128 unions (~10x slower than VP6's
+ * built-in 32-bit scalar C routines on ARM64). Report 0 for all three so VP6_InitFunctionPointers selects
+ * native 32-bit scalar C functions. */
+static void ov_vp6_cpu_features(void) {
+    const uint32_t esp = g_esp;
+    const uint32_t p_mmx = MEM32(esp + 4);
+    const uint32_t p_xmm = MEM32(esp + 8);
+    const uint32_t p_wmt = MEM32(esp + 12);
+    if (p_mmx) MEM32(p_mmx) = 0;
+    if (p_xmm) MEM32(p_xmm) = 0;
+    if (p_wmt) MEM32(p_wmt) = 0;
+    g_eax = 0;
+    g_esp = esp + 4;
+}
+
+/* 0x006FFAA7 (v12 0x006FFD4A): YUV420 -> ARGB8888 scanline converter (2 pixels per iteration).
+ * Uses precomputed 16-bit signed lookup tables initialized by sub_00700254 at:
+ *   Y_tab = 0x008149E0, U_tab = 0x008151E0, V_tab = 0x008159E0 (identical in v10 and v12). */
+static void ov_vp6_yuv420_to_argb(void) {
+    const uint32_t esp = g_esp;
+    uint32_t y_va       = MEM32(esp + 4);
+    uint32_t u_va       = MEM32(esp + 8);
+    uint32_t v_va       = MEM32(esp + 12);
+    uint32_t dst_va     = MEM32(esp + 16);
+    uint32_t dst_end_va = MEM32(esp + 20);
+
+    if (dst_end_va > dst_va) {
+        const uint32_t count = (dst_end_va - dst_va) >> 3;
+        const uint8_t* y_ptr = (const uint8_t*)ADDR(y_va);
+        const uint8_t* u_ptr = (const uint8_t*)ADDR(u_va);
+        const uint8_t* v_ptr = (const uint8_t*)ADDR(v_va);
+        uint8_t* dst_ptr     = (uint8_t*)ADDR(dst_va);
+
+        const int16_t* y_tab = (const int16_t*)ADDR(0x008149E0u);
+        const int16_t* u_tab = (const int16_t*)ADDR(0x008151E0u);
+        const int16_t* v_tab = (const int16_t*)ADDR(0x008159E0u);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t u = *u_ptr++;
+            const uint8_t v = *v_ptr++;
+            const uint8_t y0 = y_ptr[0];
+            const uint8_t y1 = y_ptr[1];
+            y_ptr += 2;
+#if defined(__aarch64__)
+            int16x4_t vu  = vld1_s16(&u_tab[(uint32_t)u * 4]);
+            int16x4_t vv  = vld1_s16(&v_tab[(uint32_t)v * 4]);
+            int16x4_t vuv = vqadd_s16(vu, vv);
+            int16x4_t vy0 = vld1_s16(&y_tab[(uint32_t)y0 * 4]);
+            int16x4_t vy1 = vld1_s16(&y_tab[(uint32_t)y1 * 4]);
+            int16x8_t vp  = vcombine_s16(vqadd_s16(vy0, vuv), vqadd_s16(vy1, vuv));
+            uint8x8_t out = vqmovun_s16(vp);
+            vst1_u8(dst_ptr, out);
+#else
+            for (int c = 0; c < 4; ++c) {
+                int uv = (int)u_tab[u * 4 + c] + (int)v_tab[v * 4 + c];
+                int p0 = (int)y_tab[y0 * 4 + c] + uv;
+                int p1 = (int)y_tab[y1 * 4 + c] + uv;
+                dst_ptr[c]     = (uint8_t)(p0 < 0 ? 0 : (p0 > 255 ? 255 : p0));
+                dst_ptr[4 + c] = (uint8_t)(p1 < 0 ? 0 : (p1 > 255 ? 255 : p1));
+            }
+#endif
+            dst_ptr += 8;
+        }
+        g_ecx = y_va + count * 2;
+        g_edx = u_va + count;
+    }
+    g_eax = 0;
+    g_esp = esp + 4;
+}
+
+void sub_006FFAA7(void) { ov_vp6_yuv420_to_argb(); }
+void sub_0070CCE8(void) { ov_vp6_cpu_features(); }
+
 static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
     { NFS_VA(0x006F5D25), ov_is_cyrix },
 #if defined(NFS_R36S)
     { NFS_VA(0x0066A9F6), ov_fx_begin_pass },
 #endif
     { NFS_VA(0x0075CCF0), ov_crt_memmove },
+    { NFS_VA(0x006FFAA7), ov_vp6_yuv420_to_argb },
+    { NFS_VA(0x0070CCE8), ov_vp6_cpu_features },
 };
 
 /* Called on every indirect call that misses its call-site cache (polymorphic vtable sites), and for every

@@ -123,3 +123,5 @@
 0x0065E6D0  0x0065E9AC  va    D3DX effect method (overrides.c k_fxMethods)
 0x0067036F  0x0067064B  va    D3DX effect method (overrides.c k_fxMethods)
 0x00670B57  0x00670E45  va    D3DX effect method (overrides.c k_fxMethods)
+0x006FFAA7  0x006FFD4A  func  VP6 YUV420 to ARGB8888 scanline converter, MMX (overrides.c)
+0x0070CCE8  0x0070CF98  func  VP6 CPU feature detection: MMX/XMM/WMT (overrides.c)

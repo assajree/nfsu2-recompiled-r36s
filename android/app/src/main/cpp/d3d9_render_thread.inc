@@ -277,11 +277,11 @@ void exec(const Cmd& c){
                 pixels=std::move(job->pixels);
             }
             else pixels=decodeDXT(t.mode(),w,h,raw.data(),raw.size());
-            if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,0))&&lr.pBits){
+            if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,D3DLOCK_DISCARD))&&lr.pBits){
                 for(uint32_t row=0;row<h;++row)std::memcpy(static_cast<uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,pixels.data()+size_t(row)*w*4,size_t(w)*4);
                 tex->UnlockRect(level);
             }
-        }else if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,0))&&lr.pBits){
+        }else if(SUCCEEDED(tex->LockRect(level,&lr,nullptr,D3DLOCK_DISCARD))&&lr.pBits){
             for(uint32_t row=0;row<c.a[3];++row)std::memcpy(static_cast<uint8_t*>(lr.pBits)+size_t(row)*lr.Pitch,static_cast<const uint8_t*>(c.p0)+size_t(row)*c.a[2],c.a[4]);
             tex->UnlockRect(level);
         }
@@ -465,12 +465,13 @@ bool textureLockAsync(uint32_t method,const uint32_t* args,uint32_t* count,uint3
         const uint32_t out=args[2],rect=args[3],flags=args[4];
         Object* o=cachedObject(args[0]);if(!o||o->kind!=Kind::Texture||!out||level>=16)return false;
         const bool fresh=texTouched.insert(key).second;
-        if(off||rect||(flags&D3DLOCK_READONLY)||(!fresh&&!(flags&D3DLOCK_DISCARD))||texLocks.count(key))return false;
+        (void)fresh;
+        if(off||rect||(flags&D3DLOCK_READONLY)||texLocks.count(key))return false;
         TexLock L;CompressedTexture* ct=o->compressed.texture.get();
         if(ct){if(level>=ct->levels||ct->faces!=1)return false;L.pitch=ct->pitch(level);L.rows=(ct->mipHeight(level)+3)/4;L.rowBytes=L.pitch;}
         else{
             D3DSURFACE_DESC d{};if(FAILED(static_cast<IDirect3DTexture9*>(o->native)->GetLevelDesc(level,&d)))return false;
-            if(d.Pool==D3DPOOL_DEFAULT||(d.Usage&(D3DUSAGE_RENDERTARGET|D3DUSAGE_DEPTHSTENCIL)))return false;
+            if((d.Pool==D3DPOOL_DEFAULT&&!(d.Usage&D3DUSAGE_DYNAMIC))||(d.Usage&(D3DUSAGE_RENDERTARGET|D3DUSAGE_DEPTHSTENCIL)))return false;
             try{L.rowBytes=rowBytes(d.Format,d.Width);}catch(...){return false;}
             L.rows=blockCompressed(d.Format)?(d.Height+3)/4:d.Height;L.pitch=(L.rowBytes+3)&~3u;
         }

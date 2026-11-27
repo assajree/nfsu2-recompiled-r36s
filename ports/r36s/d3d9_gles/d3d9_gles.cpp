@@ -2013,7 +2013,7 @@ STDMETHODIMP IDirect3DDevice9GLES::CreateTexture(UINT Width, UINT Height, UINT L
                         static_cast<unsigned>(Pool));
         }
     }
-    *ppTexture = new IDirect3DTexture9GLES(Width, Height, Levels, Usage, Format);
+    *ppTexture = new IDirect3DTexture9GLES(Width, Height, Levels, Usage, Format, Pool);
     return D3D_OK;
 }
 
