@@ -68,7 +68,7 @@ Button names are the labels printed on the R36S. The layout follows the PS2 vers
 | **B** (bottom) | Accelerate | Select / Confirm |
 | **Y** (left) | Brake / Reverse | Space |
 | **A** (right) | Handbrake (E-Brake) | Back |
-| **X** (top) | Change camera | Back |
+| **X** (top) | Change camera | Engage GPS (World Map) |
 | **R1** | Nitrous | — |
 | **L1** | Look behind | — |
 | **R2 / L2** | Shift up / Shift down (manual gearbox) | — |
