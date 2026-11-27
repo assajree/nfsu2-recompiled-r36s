@@ -203,6 +203,7 @@ int main(int argc, char **argv) {
     NFS_LOG(BOOT, "GAME_ROOT = %s", g_nfs_game_root);
     nfs_widescreen_init(g_nfs_game_root);
     NFS_LOG(BOOT, "widescreen: %d HUD offsets from scripts/NFSUnderground2.WidescreenFix.dat", nfs_widescreen_hud_entries());
+    nfs_intro_init(file_exists("MOVIES\\FMVOpening.vp6") ? 1 : 0);
 
     /* 3. Machine, image, imports */
     native32_init();

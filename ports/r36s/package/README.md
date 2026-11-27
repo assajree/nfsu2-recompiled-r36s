@@ -96,6 +96,8 @@ Button names are the labels printed on the R36S. The layout follows the PS2 vers
   | `NFSU2_RENDER=854x480` | Exact render size |
   | `NFSU2_SCREEN=854x480` | Panel size, only if it is detected wrongly |
   | `NFSU2_ROTATE=90` or `270` | Panel mounted rotated (portrait panels default to 90) |
+  | `NFSU2_SKIP_INTRO=1` | Fast Boot: skip intro videos (EA/THX/Opening/PSA) in runtime without deleting or renaming files |
+  | `NFSU2_ATTRACT_MODE=auto\|0\|1` | Title 30s Attract Mode (`auto`: disable when `FMVOpening.vp6` is missing/skipped; `0`: always off; `1`: original) |
 
   More pixels cost GPU time. On a weak GPU with a big screen, start with `NFSU2_RENDER_SCALE=0.75`.
 - **GPU-only extras** (`NFSU2_GPU_EXTRAS=1` in `nfsu2.cfg`): trilinear texture filtering, the game's colour

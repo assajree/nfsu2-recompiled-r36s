@@ -6,6 +6,9 @@
 #ifndef NFS_RUNTIME_H
 #define NFS_RUNTIME_H
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Install the crash reporter (vectored handler, after native32's). */
 void nfs_install_crash_handler(void);
@@ -34,4 +37,14 @@ uint32_t nfs_d3d9_frames(void);
 
 #define NFS_GUEST_BASE 0x00400000u
 
+/* Intro movie skipping (NFSU2_SKIP_INTRO) and Title Screen Attract Mode (NFSU2_ATTRACT_MODE). */
+void nfs_intro_init(int has_opening_fmv);
+int nfs_skip_intro_enabled(void);
+int nfs_attract_mode_suppressed(void);
+int nfs_should_skip_intro_movie(const char *filename);
+int nfs_should_skip_intro_path(const char *path);
+
+#ifdef __cplusplus
+}
+#endif
 #endif

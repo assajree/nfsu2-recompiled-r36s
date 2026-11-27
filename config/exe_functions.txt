@@ -60,6 +60,7 @@
 0x0075BC00  0x0075BED4  func  MSVC _ftol2 (native_math.c)
 0x006F5D25  0x006F5FC5  va    Cyrix CPU probe (overrides.c)
 0x0075CCF0  0x0075CFD0  va    CRT memcpy/memmove (overrides.c)
+0x004C53B0  0x004C5580  va    SplashScreen::NotificationMessage (overrides.c)
 0x005C58B8  0x005C5BE8  va    jump table: shader type -> case (native_scene.c)
 0x005C57DE  0x005C5B0E  va    jump table case 0 (native_scene.c)
 0x005C57E6  0x005C5B16  va    jump table case 1 (native_scene.c)

@@ -9,6 +9,8 @@
  * slot, arguments are at g_esp+4.., the body leaves its result in g_eax and
  * pops what `ret N` would (g_esp += 4 + N).
  */
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "recomp_types.h"
 #include "nfs_runtime.h"
@@ -174,12 +176,155 @@ static void ov_crt_memmove(void) {
     g_esp += 4;
 }
 
+/* Intro movie skipping (NFSU2_SKIP_INTRO) and Title Screen Attract Mode control
+ * (NFSU2_ATTRACT_MODE):
+ *   NFSU2_SKIP_INTRO=1          -> hide boot intro VP6 movies in memory (no files renamed)
+ *   NFSU2_SKIP_INTRO=0 / unset  -> original behavior
+ *   NFSU2_ATTRACT_MODE=auto / unset -> suppress 30s Title Attract Mode when FMVOpening.vp6
+ *                                      is absent on disk or NFSU2_SKIP_INTRO=1
+ *   NFSU2_ATTRACT_MODE=0        -> always suppress 30s Title Attract Mode
+ *   NFSU2_ATTRACT_MODE=1        -> keep original 30s Title Attract Mode (even with
+ *                                  NFSU2_SKIP_INTRO=1, unhiding FMVOpening.vp6 once the
+ *                                  Title Screen is reached)
+ */
+static int g_has_opening_fmv = 1;
+static int g_splash_reached = 0;
+
+void nfs_intro_init(int has_opening_fmv) {
+    g_has_opening_fmv = has_opening_fmv ? 1 : 0;
+    __atomic_store_n(&g_splash_reached, 0, __ATOMIC_RELEASE);
+}
+
+int nfs_skip_intro_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("NFSU2_SKIP_INTRO");
+        enabled = (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' || e[0] == 't' || e[0] == 'T')) ? 1 : 0;
+        fprintf(stderr, "[NFSU2 INTRO] NFSU2_SKIP_INTRO=%s (%s)\n",
+                (e && e[0]) ? e : "<unset>", enabled ? "skip" : "normal");
+    }
+    return enabled;
+}
+
+/* Returns: 1 = force original Attract Mode, 0 = suppress, -1 = auto */
+static int nfs_attract_env_mode(void) {
+    static int mode = -2;
+    if (mode == -2) {
+        const char *e = getenv("NFSU2_ATTRACT_MODE");
+        if (e && (e[0] == '0' || e[0] == 'f' || e[0] == 'F' ||
+                  ((e[0] == 'o' || e[0] == 'O') && (e[1] == 'f' || e[1] == 'F')))) {
+            mode = 0;
+        } else if (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' ||
+                         ((e[0] == 'o' || e[0] == 'O') && (e[1] == 'n' || e[1] == 'N')))) {
+            mode = 1;
+        } else {
+            mode = -1;
+        }
+        fprintf(stderr, "[NFSU2 ATTRACT] NFSU2_ATTRACT_MODE=%s (mode=%s, has_opening_fmv=%d, skip_intro=%d)\n",
+                (e && e[0]) ? e : "<unset>",
+                mode == 1 ? "on" : (mode == 0 ? "off" : "auto"),
+                g_has_opening_fmv, nfs_skip_intro_enabled());
+    }
+    return mode;
+}
+
+int nfs_attract_mode_suppressed(void) {
+    const int mode = nfs_attract_env_mode();
+    if (mode == 0) return 1;
+    if (mode == 1) return 0;
+    return (!g_has_opening_fmv || nfs_skip_intro_enabled()) ? 1 : 0;
+}
+
+static int ov_ascii_tolower(int c) {
+    return (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
+}
+
+static int ov_eq_or_prefix_us(const char *stem, size_t len, const char *base) {
+    const size_t blen = strlen(base);
+    if (len < blen) return 0;
+    for (size_t i = 0; i < blen; ++i) {
+        if (ov_ascii_tolower((unsigned char)stem[i]) != base[i]) return 0;
+    }
+    return (len == blen || stem[blen] == '_');
+}
+
+int nfs_should_skip_intro_movie(const char *filename) {
+    if (!filename || !nfs_skip_intro_enabled()) return 0;
+    const size_t n = strlen(filename);
+    if (n <= 4) return 0;
+    if (ov_ascii_tolower((unsigned char)filename[n - 4]) != '.' ||
+        ov_ascii_tolower((unsigned char)filename[n - 3]) != 'v' ||
+        ov_ascii_tolower((unsigned char)filename[n - 2]) != 'p' ||
+        filename[n - 1] != '6') {
+        return 0;
+    }
+    const size_t stem_len = n - 4;
+    if (ov_eq_or_prefix_us(filename, stem_len, "ealogo") ||
+        ov_eq_or_prefix_us(filename, stem_len, "thx_logo") ||
+        ov_eq_or_prefix_us(filename, stem_len, "psa")) {
+        return 1;
+    }
+    if (ov_eq_or_prefix_us(filename, stem_len, "fmvopening")) {
+        /* If user explicitly forced NFSU2_ATTRACT_MODE=1 with NFSU2_SKIP_INTRO=1,
+         * unhide FMVOpening.vp6 once the Title Screen has been reached so Attract Mode
+         * can play it cleanly after 30s idle. */
+        if (nfs_attract_env_mode() == 1 && __atomic_load_n(&g_splash_reached, __ATOMIC_ACQUIRE)) {
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int nfs_should_skip_intro_path(const char *path) {
+    if (!path || !nfs_skip_intro_enabled()) return 0;
+    const char *last_sep = NULL;
+    for (const char *p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') last_sep = p;
+    }
+    if (!last_sep) return 0;
+    const char *dir_start = last_sep;
+    while (dir_start > path && dir_start[-1] != '/' && dir_start[-1] != '\\') --dir_start;
+    if ((size_t)(last_sep - dir_start) != 6) return 0;
+    static const char k_movies[6] = { 'm', 'o', 'v', 'i', 'e', 's' };
+    for (size_t i = 0; i < 6; ++i) {
+        if (ov_ascii_tolower((unsigned char)dir_start[i]) != k_movies[i]) return 0;
+    }
+    return nfs_should_skip_intro_movie(last_sep + 1);
+}
+
+/* 0x004C53B0 (v12 0x004C5580): SplashScreen::NotificationMessage(msg, ...).
+ * On FE_TICK (0xC98356BA), compares (MEM32(0x008651AC) - [this + 0x50]) * 0.00025f > 30.0f
+ * and switches to "UG_LS_IntroFMV.fng" (FMVOpening.vp6). When FMVOpening.vp6 is missing or
+ * skipped, playback finishes immediately and reloads the Title Screen, restarting the Title
+ * music every 30s. Refreshing [this + 0x50] to the current FE tick keeps the idle timer at 0s
+ * while leaving PRESS_START ([this + 0x4C]) and all other SplashScreen messages intact. */
+static void ov_splash_notify(void) {
+    static recomp_func_t lifted_fn;
+    static int logged_suppress;
+    if (!__atomic_load_n(&g_splash_reached, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_splash_reached, 1, __ATOMIC_RELEASE);
+    }
+    if (MEM32(g_esp + 4u) == 0xC98356BAu && nfs_attract_mode_suppressed()) {
+        if (g_ecx) {
+            MEM32(g_ecx + 0x50u) = MEM32(0x008651ACu);
+            if (!logged_suppress) {
+                logged_suppress = 1;
+                fprintf(stderr, "[NFSU2 ATTRACT] suppressing 30s Title Screen Attract Mode timeout\n");
+            }
+        }
+    }
+    if (!lifted_fn) lifted_fn = recomp_lookup(NFS_VA(0x004C53B0));
+    if (lifted_fn) lifted_fn();
+}
+
 static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
     { NFS_VA(0x006F5D25), ov_is_cyrix },
 #if defined(NFS_R36S)
     { NFS_VA(0x0066A9F6), ov_fx_begin_pass },
 #endif
     { NFS_VA(0x0075CCF0), ov_crt_memmove },
+    { NFS_VA(0x004C53B0), ov_splash_notify },
 };
 
 /* Called on every indirect call that misses its call-site cache (polymorphic vtable sites), and for every

@@ -220,6 +220,12 @@ static void shim_SetWindowLongA(void) {
 static void shim_CreateFileA(void) {
     static DWORD t0; if (!t0) t0 = GetTickCount();
     const char *name = (const char *)(uintptr_t)ARG(0);
+    if (name && ARG(4) == OPEN_EXISTING && !(ARG(1) & GENERIC_WRITE) && nfs_should_skip_intro_path(name)) {
+        NFS_LOG(FILE, "+%6lu ms CreateFileA(\"%s\", %08X) -> skipped (NFSU2_SKIP_INTRO)", GetTickCount() - t0, name, ARG(1));
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        RET((uint32_t)(uintptr_t)INVALID_HANDLE_VALUE, 7);
+        return;
+    }
     HANDLE h = CreateFileA(name, ARG(1), ARG(2), (LPSECURITY_ATTRIBUTES)(uintptr_t)ARG(3), ARG(4), ARG(5),
                            (HANDLE)(uintptr_t)ARG(6));
     DWORD err = GetLastError();
